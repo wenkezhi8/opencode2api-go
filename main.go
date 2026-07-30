@@ -361,7 +361,7 @@ var (
 	port                 string
 	configPath           = "config.json"
 	modelAlias           = map[string]string{}
-	reasoningEffortMap   = map[string]string{"low": "high", "medium": "high", "xhigh": "max"}
+	reasoningEffortMap   = map[string]string{"none": "", "low": "high", "medium": "high", "high": "high", "xhigh": "max"}
 	forceDisableThinking bool
 	apiKey               string
 	debugMode            bool
@@ -532,7 +532,8 @@ type ResponsesTool struct {
 }
 
 type ReasonEffort struct {
-	Effort string `json:"effort,omitempty"`
+	Effort          string `json:"effort,omitempty"`
+	GenerateSummary *bool  `json:"generate_summary,omitempty"`
 }
 
 // ======================== 配置管理 ========================
@@ -686,6 +687,9 @@ func wantsReasoning(req *OpenAIRequest) bool {
 	if getForceDisableThinking() {
 		return false
 	}
+	if req.ReasoningEffort == "none" {
+		return false
+	}
 	if isThinkingDisabled(req.Thinking) {
 		return false
 	}
@@ -836,14 +840,20 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 	if req.ToolChoice != nil {
 		converted["tool_choice"] = req.ToolChoice
 	}
-	// 处理思维模式
-	if getForceDisableThinking() || isThinkingDisabled(req.Thinking) {
+	disableThinking := getForceDisableThinking() || isThinkingDisabled(req.Thinking) || req.ReasoningEffort == "none"
+	if disableThinking {
 		converted["thinking"] = map[string]string{"type": "disabled"}
+		delete(converted, "reasoning_effort")
 	} else {
-		converted["thinking"] = map[string]string{"type": "enabled"}
+		thinkingVal := map[string]any{"type": "enabled"}
+		if thinkMap, ok := req.Thinking.(map[string]any); ok {
+			if budget, ok := thinkMap["budget_tokens"].(float64); ok {
+				thinkingVal["budget_tokens"] = int(budget)
+			}
+		}
+		converted["thinking"] = thinkingVal
 	}
-	// 处理 reasoning_effort
-	if !getForceDisableThinking() && req.ReasoningEffort != "" {
+	if !disableThinking && req.ReasoningEffort != "" {
 		effortMap := getReasoningEffortMap()
 		if mapped, ok := effortMap[req.ReasoningEffort]; ok {
 			converted["reasoning_effort"] = mapped
@@ -2514,7 +2524,20 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if !getForceDisableThinking() && respReq.Reasoning.Effort != "" {
 		if respReq.Reasoning.Effort != "none" {
 			chatReq.ReasoningEffort = respReq.Reasoning.Effort
+		} else {
+			if chatReq.ExtraBody == nil {
+				chatReq.ExtraBody = map[string]any{}
+			}
+			if _, exists := chatReq.ExtraBody["thinking"]; !exists {
+				chatReq.ExtraBody["thinking"] = map[string]string{"type": "disabled"}
+			}
 		}
+	}
+	if !getForceDisableThinking() && respReq.Reasoning.GenerateSummary != nil {
+		if chatReq.ExtraBody == nil {
+			chatReq.ExtraBody = map[string]any{}
+		}
+		chatReq.ExtraBody["generate_summary"] = *respReq.Reasoning.GenerateSummary
 	}
 
 	wantReasoning := !getForceDisableThinking()
