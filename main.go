@@ -3308,10 +3308,26 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 #toast.error{background:#ff4d4f}
 #toast.show{opacity:1}
 .empty-hint{color:#aaa;font-size:13px;padding:20px;text-align:center}
+#loginOverlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:1000;align-items:center;justify-content:center}
+.login-box{background:#fff;border-radius:10px;padding:32px;width:380px;max-width:90vw;box-shadow:0 8px 24px rgba(0,0,0,.15)}
+.login-box h2{margin-bottom:6px}
+.login-box p{color:#666;font-size:13px;margin-bottom:20px}
+.login-box .form-group{margin-bottom:16px}
 </style>
 </head>
 <body>
-<div class="container">
+<div id="loginOverlay">
+<div class="login-box">
+<h2>OC2API 管理面板</h2>
+<p>请输入 API Key 以登录管理后台</p>
+<div class="form-group">
+<input type="password" id="loginKey" placeholder="输入 API Key" autofocus onkeydown="if(event.key==='Enter')doLogin()">
+<div class="error" id="loginError" style="color:#ff4d4f;font-size:12px;display:none;margin-top:8px">API Key 无效，请重试</div>
+</div>
+<button class="btn btn-primary" onclick="doLogin()" style="width:100%;text-align:center">登录</button>
+</div>
+</div>
+<div class="container" id="mainContent" style="display:none">
 <h1>OC2API 管理面板</h1>
 <p class="subtitle">OpenCode 模型 -> OpenAI API 代理</p>
 
@@ -3390,7 +3406,9 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 <div id="toast"></div>
 <script>
 	let aliasData={},effortData={},modelList=[],socks5Data=[];
-	async function loadConfig(){try{const r=await fetch('/admin/api/config');const cfg=await r.json();document.getElementById('api_key').value=cfg.api_key||'';document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id);renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||''}catch(e){showToast('失败: '+e.message,'error')}}
+	async function apiFetch(url,opt){const h=opt&&opt.headers||{};const k=sessionStorage.getItem('oc2api_key');if(k)h['Authorization']='Bearer '+k;opt=opt||{};opt.headers=h;const r=await fetch(url,opt);if(r.status===401){sessionStorage.removeItem('oc2api_key');document.getElementById('loginOverlay').classList.add('show');document.getElementById('mainContent').style.display='none';throw new Error('Unauthorized')}return r}
+	function doLogin(){const k=document.getElementById('loginKey').value.trim();if(!k){document.getElementById('loginError').style.display='block';return}sessionStorage.setItem('oc2api_key',k);document.getElementById('loginError').style.display='none';loadConfig()}
+	async function loadConfig(){try{const r=await apiFetch('/admin/api/config');const cfg=await r.json();document.getElementById('api_key').value=cfg.api_key||'';document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await apiFetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id);renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';document.getElementById('loginOverlay').classList.remove('show');document.getElementById('mainContent').style.display='block'}catch(e){showToast('认证失败: '+e.message,'error')}}
 	function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+modelSelectHtml(aliasData[k])+'</td><td><button class="btn btn-warning" onclick="delAlias(this)">删除</button></td></tr>').join('')}
 	function modelSelectHtml(selected){let h='<select data-field="val" class="m-select">';h+='<option value="">-- 选择模型 --</option>';for(const m of modelList){h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}h+='</select>';return h}
 	function addAliasRow(){const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+modelSelectHtml('')+'</td><td><button class="btn btn-warning" onclick="delAlias(this)">删除</button></td></tr>')}
@@ -3405,12 +3423,12 @@ function addSocks5Row(){const tb=document.querySelector('#socks5Table tbody');if
 function delSocks5(i){socks5Data.splice(i,1);renderSocks5Table()}
 function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
 function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（自动切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value='';}
-async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,api_key:document.getElementById('api_key').value};try{const r=await fetch('/admin/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');renderSocks5Select()}catch(e){showToast('保存失败: '+e.message,'error')}}
+async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,api_key:document.getElementById('api_key').value};try{const r=await apiFetch('/admin/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');renderSocks5Select()}catch(e){showToast('保存失败: '+e.message,'error')}}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 
-async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/admin/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
-async function loadStats(){try{const r=await fetch('/admin/api/stats');const d=await r.json();const ms=d.models||{};const ks=Object.keys(ms);let h='<table class="alias-table"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="5" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;for(const k of ks){const m=ms[k];h+='<tr><td>'+esc(k)+'</td><td>'+m.request_count+'</td><td>'+m.prompt_tokens+'</td><td>'+m.completion_tokens+'</td><td>'+m.total_tokens+'</td></tr>';tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}h+='<tr style="font-weight:600;background:#f8f8f8"><td>总计</td><td>'+tr+'</td><td>'+pt+'</td><td>'+ct+'</td><td>'+tt+'</td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}window.onload=function(){loadConfig();loadStats()};document.addEventListener('visibilitychange',function(){if(!document.hidden)loadStats()});
+async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await apiFetch('/admin/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
+async function loadStats(){try{const r=await apiFetch('/admin/api/stats');const d=await r.json();const ms=d.models||{};const ks=Object.keys(ms);let h='<table class="alias-table"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="5" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;for(const k of ks){const m=ms[k];h+='<tr><td>'+esc(k)+'</td><td>'+m.request_count+'</td><td>'+m.prompt_tokens+'</td><td>'+m.completion_tokens+'</td><td>'+m.total_tokens+'</td></tr>';tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}h+='<tr style="font-weight:600;background:#f8f8f8"><td>总计</td><td>'+tr+'</td><td>'+pt+'</td><td>'+ct+'</td><td>'+tt+'</td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}window.onload=async function(){try{const r=await fetch('/admin/api/config');if(r.ok){const cfg=await r.json();if(cfg.api_key){document.getElementById('loginOverlay').classList.add('show')}else{loadConfig();loadStats()}}else{document.getElementById('loginOverlay').classList.add('show')}}catch(e){document.getElementById('loginOverlay').classList.add('show')}};document.addEventListener('visibilitychange',function(){if(!document.hidden&&document.getElementById('mainContent').style.display!='none')loadStats()});
 </script>
 </body>
 </html>`
