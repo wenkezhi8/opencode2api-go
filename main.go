@@ -340,6 +340,9 @@ func fetchModels() ([]ModelInfo, error) {
 	var models []ModelInfo
 	now := time.Now().Unix()
 	for _, m := range result.Data {
+		if isModelBlocked(m.ID) {
+			continue
+		}
 		models = append(models, ModelInfo{ID: m.ID, Object: "model", Created: now, OwnedBy: "opencode"})
 	}
 	return models, nil
@@ -361,6 +364,8 @@ var (
 	port                 string
 	configPath           = "config.json"
 	modelAlias           = map[string]string{}
+	modelBlocklist       = map[string]bool{}
+	modelBlocklistMu     sync.RWMutex
 	reasoningEffortMap   = map[string]string{"none": "", "low": "high", "medium": "high", "high": "high", "xhigh": "max"}
 	forceDisableThinking bool
 	apiKey               string
@@ -442,6 +447,7 @@ type AppConfig struct {
 	Socks5Proxies        []Socks5Proxy     `json:"socks5_proxies,omitempty"`
 	ActiveSocks5         string            `json:"active_socks5,omitempty"`
 	APIKey               string            `json:"api_key,omitempty"`
+	ModelBlocklist       []string          `json:"model_blocklist,omitempty"`
 }
 
 // ======================== Claude Messages API 类型 ========================
@@ -571,6 +577,14 @@ func applyConfig(cfg AppConfig) {
 	if cfg.APIKey != "" {
 		apiKey = cfg.APIKey
 	}
+	if cfg.ModelBlocklist != nil {
+		modelBlocklistMu.Lock()
+		modelBlocklist = make(map[string]bool, len(cfg.ModelBlocklist))
+		for _, m := range cfg.ModelBlocklist {
+			modelBlocklist[m] = true
+		}
+		modelBlocklistMu.Unlock()
+	}
 
 	socks5Mu.Lock()
 	if cfg.Socks5Proxies != nil {
@@ -585,12 +599,24 @@ func applyConfig(cfg AppConfig) {
 	socks5Mu.Unlock()
 }
 
+func isModelBlocked(model string) bool {
+	modelBlocklistMu.RLock()
+	defer modelBlocklistMu.RUnlock()
+	return modelBlocklist[model]
+}
+
 func resolveModel(model string) string {
 	m := strings.TrimSpace(model)
+	if isModelBlocked(m) {
+		return ""
+	}
 	configMu.RLock()
 	alias, ok := modelAlias[m]
 	configMu.RUnlock()
 	if ok {
+		if isModelBlocked(alias) {
+			return ""
+		}
 		return alias
 	}
 	return m
