@@ -363,6 +363,7 @@ var (
 	modelAlias           = map[string]string{}
 	reasoningEffortMap   = map[string]string{"low": "high", "medium": "high", "xhigh": "max"}
 	forceDisableThinking bool
+	apiKey               string
 	debugMode            bool
 	configMu             sync.RWMutex
 )
@@ -440,6 +441,7 @@ type AppConfig struct {
 	ForceDisableThinking bool              `json:"force_disable_thinking"`
 	Socks5Proxies        []Socks5Proxy     `json:"socks5_proxies,omitempty"`
 	ActiveSocks5         string            `json:"active_socks5,omitempty"`
+	APIKey               string            `json:"api_key,omitempty"`
 }
 
 // ======================== Claude Messages API 类型 ========================
@@ -565,6 +567,9 @@ func applyConfig(cfg AppConfig) {
 		reasoningEffortMap = cfg.ReasoningEffortMap
 	}
 	forceDisableThinking = cfg.ForceDisableThinking
+	if cfg.APIKey != "" {
+		apiKey = cfg.APIKey
+	}
 
 	socks5Mu.Lock()
 	if cfg.Socks5Proxies != nil {
@@ -1339,6 +1344,38 @@ func filterResponseHeaders(h http.Header) http.Header {
 }
 
 // ======================== Chat Completions Handler ========================
+
+// ======================== API Key 认证中间件 ========================
+
+var authBypassPaths = map[string]bool{
+	"/health": true,
+}
+
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		configMu.RLock()
+		key := apiKey
+		configMu.RUnlock()
+		if key == "" || authBypassPaths[r.URL.Path] {
+			next(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			auth = r.URL.Query().Get("api_key")
+			if auth != "" {
+				auth = "Bearer " + auth
+			}
+		}
+		if auth != "Bearer "+key {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized", "message": "需要有效的 API Key（在 Authorization 请求头中传入 Bearer token）"})
+			return
+		}
+		next(w, r)
+	}
+}
 
 func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -3157,11 +3194,19 @@ func emitSSEEvent(w http.ResponseWriter, flusher http.Flusher, event string, dat
 
 // ======================== Admin 管理页面 ========================
 
+// 用于日志中隐藏部分密钥
+func maskKey(key string) string {
+	if len(key) <= 4 {
+		return "****"
+	}
+	return key[:2] + "****" + key[len(key)-2:]
+}
+
 func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		configMu.RLock()
-		cfg := AppConfig{ModelAlias: modelAlias, ReasoningEffortMap: reasoningEffortMap, ForceDisableThinking: forceDisableThinking}
+		cfg := AppConfig{ModelAlias: modelAlias, ReasoningEffortMap: reasoningEffortMap, ForceDisableThinking: forceDisableThinking, APIKey: apiKey}
 		configMu.RUnlock()
 		socks5Mu.RLock()
 		cfg.Socks5Proxies = socks5Proxies
@@ -3181,7 +3226,7 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		applyConfig(cfg)
 		if debugMode {
-			log.Printf("Config updated: aliases=%d, effort_map=%d, force_disable=%v", len(cfg.ModelAlias), len(cfg.ReasoningEffortMap), cfg.ForceDisableThinking)
+			log.Printf("Config updated: aliases=%d, effort_map=%d, force_disable=%v, api_key=%s", len(cfg.ModelAlias), len(cfg.ReasoningEffortMap), cfg.ForceDisableThinking, maskKey(cfg.APIKey))
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -3280,6 +3325,11 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 <div class="card">
 <h2>基本配置</h2>
 <div class="form-group">
+<label for="api_key">API Key（认证密钥）</label>
+<input type="password" id="api_key" placeholder="留空则不启用 API Key 认证">
+<div class="hint">客户端需在 Authorization 请求头中传入 <code>Bearer {api_key}</code>。留空 = 不启用认证。</div>
+</div>
+<div class="form-group">
 <label>
 <input type="checkbox" id="force_disable_thinking" style="margin-right:6px;width:auto">
 <strong>强制禁用思考模式</strong>
@@ -3340,7 +3390,7 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 <div id="toast"></div>
 <script>
 	let aliasData={},effortData={},modelList=[],socks5Data=[];
-	async function loadConfig(){try{const r=await fetch('/admin/api/config');const cfg=await r.json();document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id);renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||''}catch(e){showToast('失败: '+e.message,'error')}}
+	async function loadConfig(){try{const r=await fetch('/admin/api/config');const cfg=await r.json();document.getElementById('api_key').value=cfg.api_key||'';document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id);renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||''}catch(e){showToast('失败: '+e.message,'error')}}
 	function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+modelSelectHtml(aliasData[k])+'</td><td><button class="btn btn-warning" onclick="delAlias(this)">删除</button></td></tr>').join('')}
 	function modelSelectHtml(selected){let h='<select data-field="val" class="m-select">';h+='<option value="">-- 选择模型 --</option>';for(const m of modelList){h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}h+='</select>';return h}
 	function addAliasRow(){const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+modelSelectHtml('')+'</td><td><button class="btn btn-warning" onclick="delAlias(this)">删除</button></td></tr>')}
@@ -3355,7 +3405,7 @@ function addSocks5Row(){const tb=document.querySelector('#socks5Table tbody');if
 function delSocks5(i){socks5Data.splice(i,1);renderSocks5Table()}
 function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
 function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（自动切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value='';}
-async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value};try{const r=await fetch('/admin/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');renderSocks5Select()}catch(e){showToast('保存失败: '+e.message,'error')}}
+async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value,api_key:document.getElementById('api_key').value};try{const r=await fetch('/admin/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');renderSocks5Select()}catch(e){showToast('保存失败: '+e.message,'error')}}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 
@@ -3406,13 +3456,13 @@ func main() {
 	log.Printf("别名：  %d", len(modelAlias))
 	log.Printf("管理:    http://localhost:%s/admin", port)
 	log.Printf("===================")
-	http.HandleFunc("/v1/chat/completions", chatCompletionsHandler)
-	http.HandleFunc("/v1/responses", responsesHandler)
-	http.HandleFunc("/v1/messages", claudeMessagesHandler)
-	http.HandleFunc("/v1/models", listModelsHandler)
-	http.HandleFunc("/admin", adminPageHandler)
-	http.HandleFunc("/admin/api/config", adminConfigHandler)
-	http.HandleFunc("/admin/api/stats", adminStatsHandler)
+	http.HandleFunc("/v1/chat/completions", authMiddleware(chatCompletionsHandler))
+	http.HandleFunc("/v1/responses", authMiddleware(responsesHandler))
+	http.HandleFunc("/v1/messages", authMiddleware(claudeMessagesHandler))
+	http.HandleFunc("/v1/models", authMiddleware(listModelsHandler))
+	http.HandleFunc("/admin", authMiddleware(adminPageHandler))
+	http.HandleFunc("/admin/api/config", authMiddleware(adminConfigHandler))
+	http.HandleFunc("/admin/api/stats", authMiddleware(adminStatsHandler))
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			http.Redirect(w, r, "/admin", http.StatusFound)
