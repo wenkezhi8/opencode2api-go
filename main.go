@@ -373,6 +373,26 @@ var (
 	configMu             sync.RWMutex
 )
 
+var defaultBlockedModels = []string{
+	"claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+	"claude-opus-4-6", "claude-opus-4-5", "claude-opus-4-1", "claude-sonnet-5",
+	"claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4", "claude-haiku-4-5",
+	"gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash",
+	"gemini-3.1-pro", "gemini-3-flash",
+	"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.5-pro",
+	"gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano",
+	"gpt-5.3-codex-spark", "gpt-5.3-codex",
+	"gpt-5.2", "gpt-5.2-codex", "gpt-5.1", "gpt-5.1-codex-max",
+	"gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5", "gpt-5-codex", "gpt-5-nano",
+	"grok-build-0.1", "grok-4.5",
+	"deepseek-v4-pro", "deepseek-v4-flash",
+	"glm-5.2", "glm-5.1", "glm-5",
+	"minimax-m3", "minimax-m2.7", "minimax-m2.5",
+	"kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5",
+	"qwen3.6-plus", "qwen3.5-plus", "kimi-k3",
+	"big-pickle",
+}
+
 // ======================== Token 统计 ========================
 
 type ModelStats struct {
@@ -577,10 +597,14 @@ func applyConfig(cfg AppConfig) {
 	if cfg.APIKey != "" {
 		apiKey = cfg.APIKey
 	}
-	if cfg.ModelBlocklist != nil {
+	{
+		list := cfg.ModelBlocklist
+		if list == nil {
+			list = defaultBlockedModels
+		}
 		modelBlocklistMu.Lock()
-		modelBlocklist = make(map[string]bool, len(cfg.ModelBlocklist))
-		for _, m := range cfg.ModelBlocklist {
+		modelBlocklist = make(map[string]bool, len(list))
+		for _, m := range list {
 			modelBlocklist[m] = true
 		}
 		modelBlocklistMu.Unlock()
@@ -3513,6 +3537,7 @@ func main() {
 	log.Printf("上游:     https://opencode.ai/zen/v1/chat/completions (API)")
 	log.Printf("模型：  %d 个模型已加载", len(getModelIDs()))
 	log.Printf("别名：  %d", len(modelAlias))
+	log.Printf("封禁：  %d 个付费模型（如需调整请编辑 config.json 的 model_blocklist）", len(defaultBlockedModels))
 	log.Printf("管理:    http://localhost:%s/admin", port)
 	log.Printf("===================")
 	http.HandleFunc("/v1/chat/completions", authMiddleware(chatCompletionsHandler))
