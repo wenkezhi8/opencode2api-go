@@ -1347,9 +1347,10 @@ func filterResponseHeaders(h http.Header) http.Header {
 
 // ======================== API Key 认证中间件 ========================
 
-var authBypassPaths = map[string]bool{
-	"/health": true,
-}
+	var authBypassPaths = map[string]bool{
+		"/health": true,
+		"/admin":  true,
+	}
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
