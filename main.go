@@ -1438,7 +1438,6 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Model = resolveModel(req.Model)
 	if req.Model == "" {
-		modelIDs := getModelIDs()
 		req.Model = "deepseek-v4-flash-free"
 	}
 	req.Messages = fixToolCallGaps(req.Messages)
@@ -2504,7 +2503,6 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 
 	respReq.Model = resolveModel(respReq.Model)
 	if respReq.Model == "" {
-		modelIDs := getModelIDs()
 		respReq.Model = "deepseek-v4-flash-free"
 	}
 
