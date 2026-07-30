@@ -3310,6 +3310,7 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 #toast.show{opacity:1}
 .empty-hint{color:#aaa;font-size:13px;padding:20px;text-align:center}
 #loginOverlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:1000;align-items:center;justify-content:center}
+#loginOverlay.show{display:flex}
 .login-box{background:#fff;border-radius:10px;padding:32px;width:380px;max-width:90vw;box-shadow:0 8px 24px rgba(0,0,0,.15)}
 .login-box h2{margin-bottom:6px}
 .login-box p{color:#666;font-size:13px;margin-bottom:20px}
