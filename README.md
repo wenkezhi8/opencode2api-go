@@ -273,6 +273,50 @@ server {
 
 ---
 
+## API Key 认证
+
+支持可选 API Key 认证，防止未经授权的访问。
+
+### 启用方式
+
+在 `config.json` 中设置 `api_key`：
+
+```json
+{
+  "api_key": "sk-your-secret-key"
+}
+```
+
+**留空或删除该字段 = 不启用认证**（向后兼容）。
+
+### 客户端调用
+
+设置 `api_key` 后，所有请求需要携带认证信息：
+
+```bash
+# 方式一：Authorization 请求头（推荐）
+curl http://localhost:10000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}'
+
+# 方式二：URL 查询参数
+curl http://localhost:10000/v1/chat/completions?api_key=sk-your-secret-key \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+### 例外
+
+- `GET /health` 健康检查端点**不**需要认证。
+- 管理后台也需要 API Key 认证才能访问。
+
+### 管理后台设置
+
+在 Web 管理页面（`http://localhost:10000/admin`）→ **基本配置** → 可直接输入/修改 API Key，保存后立即生效。
+
+---
+
 ## 开发
 
 项目只有一个源文件 `main.go`，使用 Go 标准库实现，无第三方依赖。
