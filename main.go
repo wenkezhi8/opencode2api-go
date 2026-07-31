@@ -394,6 +394,7 @@ var (
 	reasoningEffortMap   = map[string]string{"none": "", "low": "high", "medium": "high", "high": "high", "xhigh": "max"}
 	forceDisableThinking bool
 	apiKey               string
+	defaultModel         = "deepseek-v4-flash-free"
 	debugMode            bool
 	configMu             sync.RWMutex
 )
@@ -493,6 +494,7 @@ type AppConfig struct {
 	ActiveSocks5         string            `json:"active_socks5,omitempty"`
 	APIKey               string            `json:"api_key,omitempty"`
 	ModelBlocklist       []string          `json:"model_blocklist,omitempty"`
+	DefaultModel         string            `json:"default_model,omitempty"`
 }
 
 // ======================== Claude Messages API 类型 ========================
@@ -622,6 +624,10 @@ func applyConfig(cfg AppConfig) {
 	// 支持通过配置清空 API Key（传空字符串 = 关闭认证）
 	// 注意：直接赋值，前端 admin 保存总是携带 api_key 字段
 	apiKey = cfg.APIKey
+	// 默认模型：配置为空则保持代码内置默认
+	if cfg.DefaultModel != "" {
+		defaultModel = cfg.DefaultModel
+	}
 	{
 		list := cfg.ModelBlocklist
 		if list == nil {
@@ -1521,7 +1527,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// 用户没指定模型 → 用默认
-		req.Model = "deepseek-v4-flash-free"
+		req.Model = defaultModel
 	}
 	req.Messages = fixToolCallGaps(req.Messages)
 	keepReasoning := wantsReasoning(&req)
@@ -2582,7 +2588,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	// 先解析别名，再对最终模型名做封禁检查（避免别名源名误伤）
 	respReq.Model = resolveModel(respReq.Model)
 	if respReq.Model == "" {
-		respReq.Model = "deepseek-v4-flash-free"
+		respReq.Model = defaultModel
 	}
 
 	messages := respReq.Messages
@@ -3591,6 +3597,7 @@ func main() {
 	log.Printf("端口:     %s", port)
 	log.Printf("上游:     https://opencode.ai/zen/v1/chat/completions (API)")
 	log.Printf("模型：  %d 个模型已加载", len(getModelIDs()))
+	log.Printf("默认:    %s（config.json 的 default_model 可改）", defaultModel)
 	log.Printf("别名：  %d", len(modelAlias))
 	log.Printf("封禁：  %d 个付费模型（如需调整请编辑 config.json 的 model_blocklist）", len(defaultBlockedModels))
 	log.Printf("管理:    http://localhost:%s/admin", port)
