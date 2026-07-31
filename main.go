@@ -400,6 +400,60 @@ func fetchAllUpstreamModels() ([]string, error) {
 	return ids, nil
 }
 
+// warmupHealth 启动预热：并发测试所有模型响应速度，初始化健康排序
+// 只测一次（max_tokens=1 最小请求），耗时约 3-5 秒（并发）
+func warmupHealth(models []ModelInfo) {
+	if len(models) == 0 {
+		return
+	}
+	log.Printf("健康预热：测试 %d 个模型...", len(models))
+	type result struct {
+		model   string
+		elapsed time.Duration
+	}
+	results := make(chan result, len(models))
+	var wg sync.WaitGroup
+	for _, m := range models {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			body := []byte(`{"model":"` + id + `","messages":[{"role":"user","content":"hi"}],"stream":false,"max_tokens":1}`)
+			start := time.Now()
+			_, status, _, err := callOpenCodeAPI(body, id, "", id)
+			elapsed := time.Since(start)
+			if err != nil || status < 200 || status >= 300 {
+				// 失败（限流等）：记录一个较大值，排后面
+				recordModelLatency(id, 30*time.Second)
+				results <- result{id, 30 * time.Second}
+			} else {
+				recordModelLatency(id, elapsed)
+				results <- result{id, elapsed}
+			}
+		}(m.ID)
+	}
+	wg.Wait()
+	close(results)
+	// 汇总打印
+	type r struct {
+		name string
+		dur  time.Duration
+	}
+	var all []r
+	for res := range results {
+		all = append(all, r{res.model, res.elapsed})
+	}
+	// 按耗时排序
+	for i := 1; i < len(all); i++ {
+		for j := i; j > 0 && all[j].dur < all[j-1].dur; j-- {
+			all[j], all[j-1] = all[j-1], all[j]
+		}
+	}
+	log.Printf("健康预热完成（排名）：")
+	for i, r := range all {
+		log.Printf("  %d. %s  %v", i+1, r.name, r.dur.Round(time.Millisecond))
+	}
+}
+
 func getModelIDs() []string {
 	modelMu.RLock()
 	defer modelMu.RUnlock()
@@ -526,7 +580,7 @@ func avgModelLatency(model string) float64 {
 	return (sorted[n/2-1] + sorted[n/2]) / 2
 }
 
-// sortModelsByHealth 按平均耗时升序排序（快的优先），未知耗时的排中间
+// sortModelsByHealth 按平均耗时升序排序（快的优先），未知耗时的排最后
 func sortModelsByHealth(models []string) []string {
 	type scored struct {
 		name string
@@ -536,7 +590,7 @@ func sortModelsByHealth(models []string) []string {
 	for i, m := range models {
 		avg := avgModelLatency(m)
 		if avg < 0 {
-			avg = 5.0 // 无样本：给个中等默认值，别排最前也别最后
+			avg = 999 // 无样本：排最后（等预热数据出来后会有真实值）
 		}
 		scoredList[i] = scored{m, avg}
 	}
@@ -4206,6 +4260,8 @@ func main() {
 		for _, m := range models {
 			log.Printf("  - %s", m.ID)
 		}
+		// 启动预热：并发测所有模型速度，初始化健康排序（不阻塞HTTP启动，后台跑）
+		go warmupHealth(models)
 	}
 	log.Printf("OC2API 代理服务器")
 	log.Printf("===================")
