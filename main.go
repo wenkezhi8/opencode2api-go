@@ -3601,8 +3601,11 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 <h2>基本配置</h2>
 <div class="form-group">
 <label for="api_key">API Key（认证密钥）</label>
-<input type="password" id="api_key" placeholder="留空则不启用 API Key 认证">
-<div class="hint">客户端需在 Authorization 请求头中传入 <code>Bearer {api_key}</code>。留空 = 不启用认证。</div>
+<div style="display:flex;gap:8px;align-items:center">
+<input type="password" id="api_key" placeholder="留空则不启用 API Key 认证" style="flex:1">
+<button class="btn" onclick="genApiKey()" title="一键生成强随机密钥">🎲 生成</button>
+</div>
+<div class="hint">客户端需在 Authorization 请求头中传入 <code>Bearer {api_key}</code>。留空 = 不启用认证。生成后可复制（点击按钮右侧可切换显示）。</div>
 </div>
 <div class="form-group">
 <label>
@@ -3667,6 +3670,7 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 	let aliasData={},effortData={},modelList=[],socks5Data=[];
 	async function apiFetch(url,opt){const h=opt&&opt.headers||{};const k=sessionStorage.getItem('oc2api_key');if(k)h['Authorization']='Bearer '+k;opt=opt||{};opt.headers=h;const r=await fetch(url,opt);if(r.status===401){sessionStorage.removeItem('oc2api_key');document.getElementById('loginOverlay').classList.add('show');document.getElementById('mainContent').style.display='none';throw new Error('Unauthorized')}return r}
 	function doLogin(){const k=document.getElementById('loginKey').value.trim();if(!k){document.getElementById('loginError').style.display='block';return}sessionStorage.setItem('oc2api_key',k);document.getElementById('loginError').style.display='none';loadConfig();loadStats()}
+	function genApiKey(){const chars='abcdef0123456789';let s='sk-';for(let i=0;i<48;i++)s+=chars[Math.floor(Math.random()*chars.length)];document.getElementById('api_key').value=s;showToast('已生成新 Key，记得点"保存配置"生效','success')}
 	async function loadConfig(){try{const r=await apiFetch('/admin/api/config');const cfg=await r.json();document.getElementById('api_key').value=cfg.api_key||'';document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await apiFetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id);renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';document.getElementById('loginOverlay').classList.remove('show');document.getElementById('mainContent').style.display='block'}catch(e){showToast('认证失败: '+e.message,'error')}}
 	function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+modelSelectHtml(aliasData[k])+'</td><td><button class="btn btn-warning" onclick="delAlias(this)">删除</button></td></tr>').join('')}
 	function modelSelectHtml(selected){let h='<select data-field="val" class="m-select">';h+='<option value="">-- 选择模型 --</option>';for(const m of modelList){h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}h+='</select>';return h}
