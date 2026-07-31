@@ -263,3 +263,46 @@ func TestSaveLoadTokenStats(t *testing.T) {
 		t.Errorf("二次 save/load 不幂等: %+v", m2)
 	}
 }
+
+// 14. resolveModel：别名源名即使在 blocklist 中也能正常解析（回归测试）
+// 复现 bug：deepseek-v4-flash 在默认 blocklist，但有别名 -> deepseek-v4-flash-free
+func TestResolveModelAliasSourceInBlocklist(t *testing.T) {
+	resetState()
+	// 模拟真实配置
+	configMu.Lock()
+	modelAlias["deepseek-v4-flash"] = "deepseek-v4-flash-free"
+	modelAlias["gpt-5.2"] = "deepseek-v4-flash-free"
+	configMu.Unlock()
+	modelBlocklistMu.Lock()
+	modelBlocklist["deepseek-v4-flash"] = true   // 别名源名也在黑名单（真实默认配置）
+	modelBlocklist["gpt-5.2"] = true              // 别名源名也在黑名单
+	modelBlocklist["real-blocked"] = true         // 真正被封禁的无别名模型
+	modelBlocklistMu.Unlock()
+
+	// 别名源名应解析为别名目标，不受 blocklist 影响
+	if got := resolveModel("deepseek-v4-flash"); got != "deepseek-v4-flash-free" {
+		t.Errorf("别名源名应解析为 deepseek-v4-flash-free，实际 %q", got)
+	}
+	if got := resolveModel("gpt-5.2"); got != "deepseek-v4-flash-free" {
+		t.Errorf("别名源名 gpt-5.2 应解析为 deepseek-v4-flash-free，实际 %q", got)
+	}
+	// 无别名的被封禁模型仍应返回空
+	if got := resolveModel("real-blocked"); got != "" {
+		t.Errorf("无别名的被封禁模型应返回空，实际 %q", got)
+	}
+}
+
+// 15. resolveModel：别名目标被封禁时返回空
+func TestResolveModelAliasTargetBlocked(t *testing.T) {
+	resetState()
+	configMu.Lock()
+	modelAlias["my-alias"] = "blocked-target"
+	configMu.Unlock()
+	modelBlocklistMu.Lock()
+	modelBlocklist["blocked-target"] = true
+	modelBlocklistMu.Unlock()
+
+	if got := resolveModel("my-alias"); got != "" {
+		t.Errorf("别名目标被封禁应返回空，实际 %q", got)
+	}
+}

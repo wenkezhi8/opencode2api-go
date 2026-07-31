@@ -656,17 +656,20 @@ func isModelBlocked(model string) bool {
 
 func resolveModel(model string) string {
 	m := strings.TrimSpace(model)
-	if isModelBlocked(m) {
-		return ""
-	}
+	// 别名优先：若存在别名映射，先解析再检查目标是否被封禁
+	// （别名源名本身可能在默认 blocklist 里，如 deepseek-v4-flash -> deepseek-v4-flash-free）
 	configMu.RLock()
-	alias, ok := modelAlias[m]
+	alias, hasAlias := modelAlias[m]
 	configMu.RUnlock()
-	if ok {
+	if hasAlias {
 		if isModelBlocked(alias) {
 			return ""
 		}
 		return alias
+	}
+	// 非别名模型：直接检查是否被封禁
+	if isModelBlocked(m) {
+		return ""
 	}
 	return m
 }
@@ -1506,15 +1509,18 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
-	// 用户显式指定了被封禁的模型 → 返回明确错误
-	if strings.TrimSpace(req.Model) != "" && isModelBlocked(strings.TrimSpace(req.Model)) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "模型 " + req.Model + " 不可用（已禁用）", "type": "invalid_request_error"}})
-		return
-	}
+	// 先解析别名，再对最终模型名做封禁检查（避免别名源名误伤）
+	origModel := strings.TrimSpace(req.Model)
 	req.Model = resolveModel(req.Model)
 	if req.Model == "" {
+		// 用户显式指定了模型但被封禁/无法解析 → 返回明确错误
+		if origModel != "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "模型 " + origModel + " 不可用（已禁用或无对应免费模型）", "type": "invalid_request_error"}})
+			return
+		}
+		// 用户没指定模型 → 用默认
 		req.Model = "deepseek-v4-flash-free"
 	}
 	req.Messages = fixToolCallGaps(req.Messages)
@@ -1954,12 +1960,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON"}}`, http.StatusBadRequest)
 		return
 	}
-	if strings.TrimSpace(claudeReq.Model) != "" && isModelBlocked(strings.TrimSpace(claudeReq.Model)) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "invalid_request_error", "message": "模型 " + claudeReq.Model + " 不可用（已禁用）"}})
-		return
-	}
+	// 先解析别名，再对最终模型名做封禁检查（避免别名源名误伤）
 	claudeReq.Model = resolveModel(claudeReq.Model)
 
 	messages := claudeToOpenAIMessages(claudeReq.Messages, claudeReq.System)
@@ -2578,12 +2579,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.TrimSpace(respReq.Model) != "" && isModelBlocked(strings.TrimSpace(respReq.Model)) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "模型 " + respReq.Model + " 不可用（已禁用）", "type": "invalid_request_error"}})
-		return
-	}
+	// 先解析别名，再对最终模型名做封禁检查（避免别名源名误伤）
 	respReq.Model = resolveModel(respReq.Model)
 	if respReq.Model == "" {
 		respReq.Model = "deepseek-v4-flash-free"
