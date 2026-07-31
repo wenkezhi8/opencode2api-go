@@ -590,6 +590,17 @@ func getModelsToTry(requested string) []string {
 	return ordered
 }
 
+// defaultAliasMap 默认别名映射（config.json 的 model_alias 为空时启用）
+// 多台部署零配置开箱即用，需自定义时在 config.json 的 model_alias 覆盖
+var defaultAliasMap = map[string]string{
+	"deepseek-v4-flash": "deepseek-v4-flash-free",
+	"mimo-v2.5":         "mimo-v2.5-free",
+	"ling-3.0-flash":    "ling-3.0-flash-free",
+	"nemotron":          "nemotron-3-ultra-free",
+	"north":             "north-mini-code-free",
+	"laguna":            "laguna-s-2.1-free",
+}
+
 var defaultBlockedModels = []string{
 	"claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
 	"claude-opus-4-6", "claude-opus-4-5", "claude-opus-4-1", "claude-sonnet-5",
@@ -806,8 +817,11 @@ func saveConfig(path string, cfg AppConfig) error {
 func applyConfig(cfg AppConfig) {
 	configMu.Lock()
 	defer configMu.Unlock()
-	if cfg.ModelAlias != nil {
+	// model_alias：config.json 配置了就用配置，否则用默认别名（多台部署零配置）
+	if cfg.ModelAlias != nil && len(cfg.ModelAlias) > 0 {
 		modelAlias = cfg.ModelAlias
+	} else {
+		modelAlias = defaultAliasMap
 	}
 	if cfg.ReasoningEffortMap != nil {
 		reasoningEffortMap = cfg.ReasoningEffortMap
