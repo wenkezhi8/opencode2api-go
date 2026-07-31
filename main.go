@@ -418,7 +418,7 @@ var (
 	modelAlias           = map[string]string{}
 	modelBlocklist       = map[string]bool{}
 	modelBlocklistMu     sync.RWMutex
-	reasoningEffortMap   = map[string]string{"none": "", "low": "high", "medium": "high", "high": "high", "xhigh": "max"}
+	reasoningEffortMap   = map[string]string{"none": "", "minimal": "", "low": "high", "medium": "high", "high": "high", "xhigh": "max", "max": "max"}
 	forceDisableThinking bool
 	apiKey               string
 	defaultModel         = "deepseek-v4-flash-free"
