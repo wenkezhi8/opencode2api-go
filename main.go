@@ -374,6 +374,32 @@ func fetchModels() ([]ModelInfo, error) {
 	return models, nil
 }
 
+// fetchAllUpstreamModels 获取上游全部模型（含被封禁的，用于后台别名配置提示）
+func fetchAllUpstreamModels() ([]string, error) {
+	req, _ := http.NewRequest("GET", "https://opencode.ai/zen/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer public")
+	req.Header.Set("x-opencode-session", ocSessionID)
+	resp, err := getHTTPClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(result.Data))
+	for _, m := range result.Data {
+		ids = append(ids, m.ID)
+	}
+	return ids, nil
+}
+
 func getModelIDs() []string {
 	modelMu.RLock()
 	defer modelMu.RUnlock()
@@ -3897,6 +3923,22 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// adminUpstreamModelsHandler 返回上游全部模型列表（供后台别名配置自动补全）
+func adminUpstreamModelsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	initOCSession()
+	ids, err := fetchAllUpstreamModels()
+	if err != nil {
+		http.Error(w, `{"error":"无法获取上游模型"}`, http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"models": ids})
+}
+
 func adminStatsHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -4093,7 +4135,7 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 	async function apiFetch(url,opt){const h=opt&&opt.headers||{};const k=sessionStorage.getItem('oc2api_key');if(k)h['Authorization']='Bearer '+k;opt=opt||{};opt.headers=h;const r=await fetch(url,opt);if(r.status===401){sessionStorage.removeItem('oc2api_key');document.getElementById('loginOverlay').classList.add('show');document.getElementById('mainContent').style.display='none';throw new Error('Unauthorized')}return r}
 	function doLogin(){const k=document.getElementById('loginKey').value.trim();if(!k){document.getElementById('loginError').style.display='block';return}sessionStorage.setItem('oc2api_key',k);document.getElementById('loginError').style.display='none';loadConfig();loadStats()}
 	function genApiKey(){const chars='abcdef0123456789';let s='sk-';for(let i=0;i<48;i++)s+=chars[Math.floor(Math.random()*chars.length)];document.getElementById('api_key').value=s;showToast('已生成新 Key，记得点"保存配置"生效','success')}
-	async function loadConfig(){try{const r=await apiFetch('/admin/api/config');const cfg=await r.json();document.getElementById('api_key').value=cfg.api_key||'';document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await apiFetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id);const dl=document.getElementById('modelHints');if(dl){const seen=new Set();let opts='';[...Object.values(aliasData),...modelList].forEach(m=>{if(m&&!seen.has(m)){seen.add(m);opts+='<option value="'+esc(m)+'">'}});dl.innerHTML=opts}renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';document.getElementById('loginOverlay').classList.remove('show');document.getElementById('mainContent').style.display='block'}catch(e){showToast('认证失败: '+e.message,'error')}}
+	async function loadConfig(){try{const r=await apiFetch('/admin/api/config');const cfg=await r.json();document.getElementById('api_key').value=cfg.api_key||'';document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await apiFetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id);const dl=document.getElementById('modelHints');if(dl){(async()=>{try{const ur=await apiFetch('/admin/api/upstream-models');const ud=await ur.json();const ups=ud.models||[];const seen=new Set();let opts='';[...ups,...Object.values(aliasData),...modelList].forEach(m=>{if(m&&!seen.has(m)){seen.add(m);opts+='<option value="'+esc(m)+'">'}});dl.innerHTML=opts}catch(e){const seen=new Set();let opts='';[...Object.values(aliasData),...modelList].forEach(m=>{if(m&&!seen.has(m)){seen.add(m);opts+='<option value="'+esc(m)+'">'}});dl.innerHTML=opts}})()}renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';document.getElementById('loginOverlay').classList.remove('show');document.getElementById('mainContent').style.display='block'}catch(e){showToast('认证失败: '+e.message,'error')}}
 	function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData).sort();if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key" placeholder="请求名"></td><td><input value="'+esc(aliasData[k])+'" data-field="val" placeholder="实际模型名" list="modelHints"></td><td><button class="btn btn-warning" onclick="delAlias(this)">删除</button></td></tr>').join('')}
 	function modelSelectHtml(selected){let h='<select data-field="val" class="m-select">';h+='<option value="">-- 选择模型 --</option>';let matched=false;for(const m of modelList){const sel=(selected===m);if(sel)matched=true;h+='<option value="'+esc(m)+'"'+(sel?' selected':'')+'>'+esc(m)+'</option>'}if(selected&&!matched){h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+'</option>'}h+='</select>';return h}
 	function addAliasRow(){const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td><input value="" placeholder="实际模型名" data-field="val" list="modelHints"></td><td><button class="btn btn-warning" onclick="delAlias(this)">删除</button></td></tr>')}
@@ -4168,6 +4210,7 @@ func main() {
 	http.HandleFunc("/admin", authMiddleware(adminPageHandler))
 	http.HandleFunc("/admin/api/config", authMiddleware(adminConfigHandler))
 	http.HandleFunc("/admin/api/stats", authMiddleware(adminStatsHandler))
+	http.HandleFunc("/admin/api/upstream-models", authMiddleware(adminUpstreamModelsHandler))
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			http.Redirect(w, r, "/admin", http.StatusFound)
