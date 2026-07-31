@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"bufio"
@@ -182,12 +182,13 @@ var (
 )
 
 const socks5RR = "__round_robin__"
+
 var socks5RRIndex uint32
 
 var (
-	socks5Client      *http.Client // 缓存的 SOCKS5 客户端
-	socks5ClientAddr  string       // 缓存对应的代理地址
-	socks5Clients     map[string]*http.Client // 轮询模式的每个代理 client 缓存
+	socks5Client     *http.Client            // 缓存的 SOCKS5 客户端
+	socks5ClientAddr string                  // 缓存对应的代理地址
+	socks5Clients    map[string]*http.Client // 轮询模式的每个代理 client 缓存
 )
 
 func getHTTPClient() *http.Client {
@@ -293,10 +294,10 @@ func randomHex(n int) string {
 // ======================== OpenCode 会话 ========================
 
 var (
-	ocSessionID string
-	ocProjectID string
-	ocClientVer string
-	ocOnce      sync.Once
+	ocSessionID  string
+	ocProjectID  string
+	ocClientVer  string
+	ocOnce       sync.Once
 	requestCount atomic.Int64
 )
 
@@ -339,7 +340,7 @@ type ModelInfo struct {
 }
 
 var (
-	modelsCache   []ModelInfo
+	modelsCache  []ModelInfo
 	modelMu      sync.RWMutex
 	modelsLoaded bool
 )
@@ -509,26 +510,26 @@ var (
 // ======================== 数据模型 ========================
 
 type OpenAIRequest struct {
-	Model           string                 `json:"model"`
-	Messages        []Message              `json:"messages"`
-	Stream          bool                   `json:"stream"`
-	Temperature     *float64               `json:"temperature,omitempty"`
-	MaxTokens       int                    `json:"max_tokens,omitempty"`
-	TopP            *float64               `json:"top_p,omitempty"`
+	Model           string         `json:"model"`
+	Messages        []Message      `json:"messages"`
+	Stream          bool           `json:"stream"`
+	Temperature     *float64       `json:"temperature,omitempty"`
+	MaxTokens       int            `json:"max_tokens,omitempty"`
+	TopP            *float64       `json:"top_p,omitempty"`
 	Thinking        any            `json:"thinking,omitempty"`
-	ReasoningEffort string                 `json:"reasoning_effort,omitempty"`
+	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
 	ExtraBody       map[string]any `json:"extra_body,omitempty"`
-	Tools           []Tool                 `json:"tools,omitempty"`
+	Tools           []Tool         `json:"tools,omitempty"`
 	ToolChoice      any            `json:"tool_choice,omitempty"`
 }
 
 type Message struct {
-	Role             string      `json:"role,omitempty"`
-	Content          any `json:"content,omitempty"`
-	ToolCalls        []ToolCall  `json:"tool_calls,omitempty"`
-	ToolCallID       string      `json:"tool_call_id,omitempty"`
-	Name             string      `json:"name,omitempty"`
-	ReasoningContent *string     `json:"reasoning_content,omitempty"`
+	Role             string     `json:"role,omitempty"`
+	Content          any        `json:"content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string     `json:"tool_call_id,omitempty"`
+	Name             string     `json:"name,omitempty"`
+	ReasoningContent *string    `json:"reasoning_content,omitempty"`
 }
 
 type ToolCall struct {
@@ -548,8 +549,8 @@ type Tool struct {
 }
 
 type ToolFunction struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
 	Parameters  map[string]any `json:"parameters"`
 }
 
@@ -567,40 +568,40 @@ type AppConfig struct {
 // ======================== Claude Messages API 类型 ========================
 
 type ClaudeRequest struct {
-	Model      string          `json:"model"`
-	Messages   []ClaudeMessage `json:"messages"`
-	System     any     `json:"system,omitempty"`
-	MaxTokens  int             `json:"max_tokens,omitempty"`
-	Temperature *float64       `json:"temperature,omitempty"`
-	TopP       *float64        `json:"top_p,omitempty"`
-	Stream     bool            `json:"stream,omitempty"`
-	Tools      []ClaudeTool    `json:"tools,omitempty"`
-	ToolChoice any     `json:"tool_choice,omitempty"`
-	Metadata   any     `json:"metadata,omitempty"`
-	Thinking   any     `json:"thinking,omitempty"`
+	Model       string          `json:"model"`
+	Messages    []ClaudeMessage `json:"messages"`
+	System      any             `json:"system,omitempty"`
+	MaxTokens   int             `json:"max_tokens,omitempty"`
+	Temperature *float64        `json:"temperature,omitempty"`
+	TopP        *float64        `json:"top_p,omitempty"`
+	Stream      bool            `json:"stream,omitempty"`
+	Tools       []ClaudeTool    `json:"tools,omitempty"`
+	ToolChoice  any             `json:"tool_choice,omitempty"`
+	Metadata    any             `json:"metadata,omitempty"`
+	Thinking    any             `json:"thinking,omitempty"`
 }
 
 type ClaudeMessage struct {
-	Role    string      `json:"role"`
-	Content any `json:"content"`
+	Role    string `json:"role"`
+	Content any    `json:"content"`
 }
 
 type ClaudeContent struct {
-	Type      string      `json:"type"`
-	Text      string      `json:"text,omitempty"`
-	Thinking  string      `json:"thinking,omitempty"`
-	Signature string      `json:"signature,omitempty"`
-	ID        string      `json:"id,omitempty"`
-	Name      string      `json:"name,omitempty"`
-	Input     any `json:"input,omitempty"`
-	ToolUseID string      `json:"tool_use_id,omitempty"`
-	Content   any `json:"content,omitempty"`
+	Type      string `json:"type"`
+	Text      string `json:"text,omitempty"`
+	Thinking  string `json:"thinking,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	ID        string `json:"id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Input     any    `json:"input,omitempty"`
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	Content   any    `json:"content,omitempty"`
 }
 
 type ClaudeTool struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description,omitempty"`
-	InputSchema any `json:"input_schema"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	InputSchema any    `json:"input_schema"`
 }
 
 type ClaudeResponse struct {
@@ -622,7 +623,7 @@ type ClaudeUsage struct {
 
 type ResponsesAPIRequest struct {
 	Model             string          `json:"model"`
-	Input             any     `json:"input"`
+	Input             any             `json:"input"`
 	Messages          []Message       `json:"messages,omitempty"`
 	Instructions      string          `json:"instructions,omitempty"`
 	Stream            bool            `json:"stream,omitempty"`
@@ -635,20 +636,20 @@ type ResponsesAPIRequest struct {
 	Include           []string        `json:"include,omitempty"`
 	Store             *bool           `json:"store,omitempty"`
 	Tools             []ResponsesTool `json:"tools,omitempty"`
-	ToolChoice        any     `json:"tool_choice,omitempty"`
+	ToolChoice        any             `json:"tool_choice,omitempty"`
 	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
-	Stop              any     `json:"stop,omitempty"`
+	Stop              any             `json:"stop,omitempty"`
 	User              string          `json:"user,omitempty"`
-	StreamOptions     any     `json:"stream_options,omitempty"`
-	Metadata          any     `json:"metadata,omitempty"`
+	StreamOptions     any             `json:"stream_options,omitempty"`
+	Metadata          any             `json:"metadata,omitempty"`
 }
 
 type ResponsesTool struct {
-	Type        string                 `json:"type"`
-	Name        string                 `json:"name,omitempty"`
-	Description string                 `json:"description,omitempty"`
+	Type        string         `json:"type"`
+	Name        string         `json:"name,omitempty"`
+	Description string         `json:"description,omitempty"`
 	Parameters  map[string]any `json:"parameters,omitempty"`
-	Function    *ToolFunction          `json:"function,omitempty"`
+	Function    *ToolFunction  `json:"function,omitempty"`
 }
 
 type ReasonEffort struct {
@@ -1508,7 +1509,7 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string) (io.ReadCloser, 
 // ======================== 安全响应头过滤 ========================
 
 var safeResponseHeaders = map[string]bool{
-	"Content-Type":   true,
+	"Content-Type":          true,
 	"X-RateLimit-Limit":     true,
 	"X-RateLimit-Remaining": true,
 	"X-RateLimit-Reset":     true,
@@ -2339,7 +2340,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 						"type":  "content_block_delta",
 						"index": blockIndex - 1,
 						"delta": map[string]any{
-							"type":          "input_json_delta",
+							"type":         "input_json_delta",
 							"partial_json": argDelta,
 						},
 					})
@@ -3257,7 +3258,7 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 		Created int64  `json:"created"`
 		Choices []struct {
 			FinishReason string `json:"finish_reason"`
-			Message struct {
+			Message      struct {
 				Content          string     `json:"content"`
 				ReasoningContent string     `json:"reasoning_content"`
 				ToolCalls        []ToolCall `json:"tool_calls"`
@@ -3692,11 +3693,3 @@ func main() {
 		log.Fatal(err)
 	}
 }
-
-
-
-
-
-
-
-
