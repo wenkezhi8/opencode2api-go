@@ -1412,6 +1412,44 @@ func buildOCRequest(modelID string, bodyMap map[string]any) (*http.Request, erro
 	return req, nil
 }
 
+// 检测上游是否返回"上下文超长"错误——这类错误所有模型都会失败，不应触发 failover
+func isContextExceeded(status int, body []byte) bool {
+	if status != 400 {
+		return false
+	}
+	var e struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &e); err != nil {
+		return false
+	}
+	return e.Error.Code == "context_length_exceeded" ||
+		strings.Contains(strings.ToLower(string(body)), "context window")
+}
+
+// 从上游错误响应提取用户可读的错误信息
+func extractUpstreamError(status int, body []byte) string {
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &e); err == nil && e.Error.Message != "" {
+		if e.Error.Code == "context_length_exceeded" {
+			return "请求内容超过模型上下文窗口限制（context length exceeded），请缩短对话或减少历史消息"
+		}
+		return e.Error.Message
+	}
+	if status == 429 {
+		return "上游模型限流中，请稍后重试"
+	}
+	return fmt.Sprintf("上游服务错误 (HTTP %d)", status)
+}
+
 func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Header, error) {
 	initOCSession()
 	modelsToTry := getModelsToTry(modelID)
@@ -1453,6 +1491,10 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Hea
 		if debugMode {
 			log.Printf("[upstream error] model=%s status=%d body=%s", tryModel, resp.StatusCode, string(errBody))
 		}
+		// 上下文超长：所有模型都会失败，立即返回明确错误，不做 failover
+		if isContextExceeded(resp.StatusCode, errBody) {
+			return nil, resp.StatusCode, resp.Header, fmt.Errorf("context_exceeded: %s", extractUpstreamError(resp.StatusCode, errBody))
+		}
 		// 429 限流：标记冷却，继续尝试其他模型
 		if resp.StatusCode == 429 {
 			markRateLimited(tryModel)
@@ -1463,7 +1505,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Hea
 			lastErr = fmt.Errorf("upstream error")
 			continue
 		}
-		return nil, resp.StatusCode, resp.Header, fmt.Errorf("upstream error")
+		return nil, resp.StatusCode, resp.Header, fmt.Errorf("upstream error: %s", extractUpstreamError(resp.StatusCode, errBody))
 	}
 	return nil, 500, nil, lastErr
 }
@@ -1498,6 +1540,10 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string) (io.ReadCloser, 
 		if debugMode {
 			log.Printf("[upstream error] model=%s status=%d body=%s", tryModel, resp.StatusCode, string(errBody))
 		}
+		// 上下文超长：所有模型都会失败，立即返回明确错误，不做 failover
+		if isContextExceeded(resp.StatusCode, errBody) {
+			return nil, resp.StatusCode, resp.Header, fmt.Errorf("context_exceeded: %s", extractUpstreamError(resp.StatusCode, errBody))
+		}
 		// 429 限流：标记冷却，继续尝试其他模型
 		if resp.StatusCode == 429 {
 			markRateLimited(tryModel)
@@ -1506,7 +1552,7 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string) (io.ReadCloser, 
 		if resp.StatusCode >= 500 {
 			continue
 		}
-		return nil, resp.StatusCode, resp.Header, fmt.Errorf("upstream error")
+		return nil, resp.StatusCode, resp.Header, fmt.Errorf("upstream error: %s", extractUpstreamError(resp.StatusCode, errBody))
 	}
 	return nil, 500, nil, fmt.Errorf("all models failed")
 }
@@ -1611,7 +1657,15 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
-			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error", "type": "upstream_error"}})
+			msg := "upstream error"
+			if err != nil {
+				msg = err.Error()
+				// 去掉 "context_exceeded: " 前缀，只保留可读信息
+				if strings.HasPrefix(msg, "context_exceeded: ") {
+					msg = strings.TrimPrefix(msg, "context_exceeded: ")
+				}
+			}
+			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": msg, "type": "upstream_error"}})
 			return
 		}
 		defer upResp.Close()
@@ -1679,7 +1733,14 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error", "type": "upstream_error"}})
+		msg := "upstream error"
+		if err != nil {
+			msg = err.Error()
+			if strings.HasPrefix(msg, "context_exceeded: ") {
+				msg = strings.TrimPrefix(msg, "context_exceeded: ")
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": msg, "type": "upstream_error"}})
 		return
 	}
 	outBody := respBody
