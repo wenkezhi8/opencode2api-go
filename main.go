@@ -436,8 +436,8 @@ func isRateLimited(model string) bool {
 // ======================== 模型健康排序（按历史响应耗时） ========================
 
 const (
-	healthSampleMax = 10 // 每个模型保留的最近耗时样本数
-	healthWindow    = 5 * time.Minute // 样本有效窗口，超时旧样本丢弃
+	healthSampleMax = 30               // 每个模型保留的最近耗时样本数（覆盖低频场景）
+	healthWindow    = 30 * time.Minute // 样本有效窗口，超时旧样本丢弃
 )
 
 // modelHealth 单个模型的健康记录
@@ -476,7 +476,8 @@ func recordModelLatency(model string, elapsed time.Duration) {
 	modelHealthMu.Unlock()
 }
 
-// avgModelLatency 返回模型平均耗时（秒）；无样本返回 -1
+// avgModelLatency 返回模型中位耗时（秒）；无样本返回 -1
+// 用中位数而非平均值：单次异常慢响应（如20s）不会拖垮整体排序
 func avgModelLatency(model string) float64 {
 	modelHealthMu.RLock()
 	defer modelHealthMu.RUnlock()
@@ -484,11 +485,19 @@ func avgModelLatency(model string) float64 {
 	if !ok || len(h.samples) == 0 {
 		return -1
 	}
-	var sum float64
-	for _, s := range h.samples {
-		sum += s
+	// 拷贝排序取中位数
+	sorted := make([]float64, len(h.samples))
+	copy(sorted, h.samples)
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j] < sorted[j-1]; j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
 	}
-	return sum / float64(len(h.samples))
+	n := len(sorted)
+	if n%2 == 1 {
+		return sorted[n/2]
+	}
+	return (sorted[n/2-1] + sorted[n/2]) / 2
 }
 
 // sortModelsByHealth 按平均耗时升序排序（快的优先），未知耗时的排中间
