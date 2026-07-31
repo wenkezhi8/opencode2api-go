@@ -1950,10 +1950,46 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	// 模型列表展示客户端别名（如 deepseek-v4-flash 而非 deepseek-v4-flash-free）
+	rev := buildAliasReverseMap()
+	displayModels := make([]ModelInfo, len(models))
+	for i, m := range models {
+		displayModels[i] = m
+		if n, ok := rev[m.ID]; ok {
+			displayModels[i].ID = n
+		}
+	}
 	json.NewEncoder(w).Encode(map[string]any{
 		"object": "list",
-		"data":   models,
+		"data":   displayModels,
 	})
+}
+
+// buildAliasReverseMap 构建 实际模型名 → 客户端别名 的逆映射（用于模型列表展示）
+func buildAliasReverseMap() map[string]string {
+	configMu.RLock()
+	aliases := modelAlias
+	configMu.RUnlock()
+	rev := make(map[string]string)
+	for clientName, realName := range aliases {
+		if clientName == "" || realName == "" || clientName == realName {
+			continue
+		}
+		// 已有则保留第一个（避免多别名冲突时乱跳）
+		if _, ok := rev[realName]; !ok {
+			rev[realName] = clientName
+		}
+	}
+	return rev
+}
+
+// displayModelName 把实际模型名转换为客户端可见的别名（无别名则原样）
+func displayModelName(realName string) string {
+	rev := buildAliasReverseMap()
+	if n, ok := rev[realName]; ok {
+		return n
+	}
+	return realName
 }
 
 // ======================== Claude Messages API ========================
