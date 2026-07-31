@@ -1471,6 +1471,32 @@ func isContextExceeded(status int, body []byte) bool {
 		strings.Contains(strings.ToLower(string(body)), "context window")
 }
 
+// isUpstreamErrorBody 检测 HTTP 200 但 body 是错误对象（伪成功）
+func isUpstreamErrorBody(body []byte) bool {
+	var e struct {
+		Error any `json:"error"`
+	}
+	if err := json.Unmarshal(body, &e); err != nil {
+		return false
+	}
+	return e.Error != nil
+}
+
+// isStreamErrorBody 检测流式响应的开头是否错误体（非 SSE 格式或含 error）
+func isStreamErrorBody(r io.Reader) bool {
+	br := bufio.NewReader(r)
+	peek, err := br.Peek(256)
+	if err != nil && err != io.EOF {
+		// 读取失败也视为故障，但无法回退（body 已损坏）
+		return true
+	}
+	// 非 SSE 格式（没有 "data: "）且像 JSON 错误体 → 伪成功
+	if !bytes.Contains(peek, []byte("data: ")) && bytes.Contains(peek, []byte(`"error"`)) {
+		return true
+	}
+	return false
+}
+
 // 从上游错误响应提取用户可读的错误信息
 func extractUpstreamError(status int, body []byte) string {
 	var e struct {
@@ -1626,6 +1652,14 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, sessionKey string, dis
 			if isAnthropicFormat(b) {
 				b = convertAnthropicToOpenAI(b, tryModel)
 			}
+			// 伪成功：HTTP 200 但 body 是错误（如 Upstream request failed）
+			// → 标记该模型故障并继续尝试其他模型
+			if isUpstreamErrorBody(b) {
+				log.Printf("[failover] 模型 %s 返回伪成功(200但body含error)，继续切换", tryModel)
+				markRateLimited(tryModel)
+				lastErr = fmt.Errorf("upstream error: %s", extractUpstreamError(200, b))
+				continue
+			}
 			if tryModel != modelID {
 				log.Printf("[failover] 模型 %s → %s 成功", modelID, tryModel)
 			}
@@ -1678,6 +1712,12 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, sessionKey strin
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			// 伪成功检测：peek 一小段看是否错误体（Upstream request failed 等）
+			if isStreamErrorBody(resp.Body) {
+				log.Printf("[failover] 模型 %s 返回伪成功(流式error)，继续切换", tryModel)
+				markRateLimited(tryModel)
+				continue
+			}
 			if tryModel != modelID {
 				log.Printf("[failover] 模型 %s → %s 成功(stream)", modelID, tryModel)
 			}
