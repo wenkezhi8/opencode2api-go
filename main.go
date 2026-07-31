@@ -1488,34 +1488,95 @@ func convertResponse(data []byte, keepReasoning bool) ([]byte, error) {
 // ======================== OpenCode 上游调用 ========================
 
 // 会话隔离：客户端会话标识 → 独立 ocSessionID（有 ID 独立，无 ID 全局兜底）
+// 为防止长期运行内存无限增长，sessionMap 带时间戳，支持过期清理和容量上限
+const (
+	sessionMapMax     = 500                    // 最大映射条数，超出清理最旧的
+	sessionMapExpire  = 2 * time.Hour          // 单条映射过期时间（不活跃即失效）
+	sessionCleanEvery = 100                    // 每新增 N 条触发一次清理
+)
+
+type sessionEntry struct {
+	sid      string
+	lastUsed time.Time
+}
+
 var (
-	sessionMap   = map[string]string{}
-	sessionMapMu sync.RWMutex
+	sessionMap     = map[string]*sessionEntry{}
+	sessionMapMu   sync.RWMutex
+	sessionAddCnt  int // 新增计数，触发清理
 )
 
 // getSessionID 根据客户端会话 key 返回对应的上游 session ID：
 // key 存在则复用已有，不存在则新建（每个客户端会话独立）
+// cleanupSessionMap 清理过期条目，超出上限时删最旧的（调用方需持锁）
+func cleanupSessionMap() {
+	now := time.Now()
+	// 1. 清理过期条目
+	for k, e := range sessionMap {
+		if now.Sub(e.lastUsed) > sessionMapExpire {
+			delete(sessionMap, k)
+		}
+	}
+	// 2. 超出容量上限，删最旧的（按 lastUsed 升序）
+	if len(sessionMap) > sessionMapMax {
+		type kv struct {
+			k string
+			t time.Time
+		}
+		all := make([]kv, 0, len(sessionMap))
+		for k, e := range sessionMap {
+			all = append(all, kv{k, e.lastUsed})
+		}
+		// 部分排序找最旧的 (len-sessionMapMax) 个
+		toRemove := len(sessionMap) - sessionMapMax
+		// 简单冒泡：把最旧的 toRemove 个挪到前面
+		for i := 0; i < toRemove; i++ {
+			minIdx := i
+			for j := i + 1; j < len(all); j++ {
+				if all[j].t.Before(all[minIdx].t) {
+					minIdx = j
+				}
+			}
+			all[i], all[minIdx] = all[minIdx], all[i]
+		}
+		for i := 0; i < toRemove; i++ {
+			delete(sessionMap, all[i].k)
+		}
+	}
+}
+
 func getSessionID(key string) string {
 	if key == "" {
 		// 无会话标识：全局兜底（现状行为）
 		return ocSessionID
 	}
+	now := time.Now()
 	sessionMapMu.RLock()
-	sid, ok := sessionMap[key]
+	e, ok := sessionMap[key]
 	sessionMapMu.RUnlock()
-	if ok {
-		return sid
+	if ok && now.Sub(e.lastUsed) <= sessionMapExpire {
+		// 命中：更新最后使用时间
+		sessionMapMu.Lock()
+		e.lastUsed = now
+		sessionMapMu.Unlock()
+		return e.sid
 	}
-	sid = "ses_" + randomString(24)
+	sid := "ses_" + randomString(24)
 	sessionMapMu.Lock()
 	// 双检：可能并发已创建
 	if existing, ok := sessionMap[key]; ok {
-		sid = existing
+		sid = existing.sid
+		existing.lastUsed = now
 	} else {
-		sessionMap[key] = sid
+		sessionMap[key] = &sessionEntry{sid: sid, lastUsed: now}
+		sessionAddCnt++
+		// 定期清理：每新增 sessionCleanEvery 条触发一次
+		if sessionAddCnt%sessionCleanEvery == 0 {
+			cleanupSessionMap()
+		}
 	}
 	sessionMapMu.Unlock()
-	log.Printf("[session] 客户端会话 %s → 上游 %s", key, sid)
+	log.Printf("[session] 客户端会话 %s → 上游 %s (映射总数 %d)", key, sid, len(sessionMap))
 	return sid
 }
 
