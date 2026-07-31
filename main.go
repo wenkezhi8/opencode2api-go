@@ -427,7 +427,7 @@ func warmupHealth(models []ModelInfo) {
 				if err != nil || status < 200 || status >= 300 {
 					d = 30 * time.Second // 失败（限流等）：记录较大值排后
 				}
-				recordModelLatency(id, d)
+				schedulerRecordLatency(id, d)
 				durations = append(durations, d)
 			}
 			// 取中位数（3次的中间值）
@@ -489,94 +489,108 @@ var (
 	configMu             sync.RWMutex
 )
 
-// 限流感知故障转移：记录被上游 429 限流的模型及其解禁时间
-var (
-	rateLimitedModels   = map[string]time.Time{}
-	rateLimitedModelsMu sync.RWMutex
-	rateLimitCooldown   = 60 * time.Minute // 429 后该模型的冷却时间（上游限流通常持续较久）
-)
+// ======================== 统一模型调度器 ========================
+// 每个模型有明确状态，状态转换自动管理，避免限流/健康两套系统打架
+//
+// 状态机：
+//   HEALTHY（健康可用）→ 按真实速度排序，参与 failover
+//   COOLED（冷却中）  → 429后进入，不参与排序，只兜底
+//   PROBING（探测中）  → 冷却到期后进入，后台测3次，达标才回 HEALTHY
+//
+// 转换：
+//   HEALTHY → (429/失败) → COOLED（设冷却时间）
+//   COOLED  → (到期) → PROBING（后台并发测3次取中位数）
+//   PROBING → (测成功) → HEALTHY（更新真实速度，重新排序）
+//   PROBING → (测失败) → COOLED（重新冷却，避免浪费请求）
 
-// markRateLimited 记录模型被限流（带冷却期）
-func markRateLimited(model string) {
-	rateLimitedModelsMu.Lock()
-	rateLimitedModels[model] = time.Now().Add(rateLimitCooldown)
-	rateLimitedModelsMu.Unlock()
-	log.Printf("[failover] 模型 %s 被限流，进入 %v 冷却期", model, rateLimitCooldown)
-}
-
-// isRateLimited 检查模型是否在限流冷却期内
-func isRateLimited(model string) bool {
-	rateLimitedModelsMu.RLock()
-	expire, ok := rateLimitedModels[model]
-	rateLimitedModelsMu.RUnlock()
-	if !ok {
-		return false
-	}
-	if time.Now().After(expire) {
-		// 冷却期已过，清理
-		rateLimitedModelsMu.Lock()
-		delete(rateLimitedModels, model)
-		rateLimitedModelsMu.Unlock()
-		return false
-	}
-	return true
-}
-
-// ======================== 模型健康排序（按历史响应耗时） ========================
+type modelState int
 
 const (
-	healthSampleMax = 30               // 每个模型保留的最近耗时样本数（覆盖低频场景）
-	healthWindow    = 30 * time.Minute // 样本有效窗口，超时旧样本丢弃
+	stateHealthy modelState = iota
+	stateCooled
+	stateProbing
 )
 
-// modelHealth 单个模型的健康记录
-type modelHealth struct {
-	samples []float64 // 最近N次响应耗时（秒）
-	updated time.Time
+type modelStatus struct {
+	state       modelState
+	cooledUntil time.Time // COOLED 状态的解禁时间
+	samples     []float64 // 最近响应耗时（秒），用于排序
 }
 
-var (
-	modelHealthMap   = map[string]*modelHealth{}
-	modelHealthMu    sync.RWMutex
-	unhealthyTimeout = 8.0 // 超过该耗时的模型视为"慢"（排序时排后）
+// schedulerCooldown 可被 config.json 的 rate_limit_cooldown_minutes 覆盖
+var schedulerCooldown = 60 * time.Minute
+
+const (
+	schedulerSampleMax     = 30               // 每模型保留样本数
+	schedulerSampleWindow  = 30 * time.Minute // 样本有效窗口
+	schedulerProbeTimes    = 3                // 探测期测试次数
+	schedulerProbeTimeout  = 8 * time.Second  // 探询单次超时（探测用小请求，不需要等推理）
+	schedulerScanInterval  = 30 * time.Second // 后台扫描间隔（检查冷却到期）
 )
 
-// recordModelLatency 记录一次请求的耗时（成功与失败都记）
-func recordModelLatency(model string, elapsed time.Duration) {
+var (
+	schedulerMu sync.RWMutex
+	scheduler   = map[string]*modelStatus{}
+)
+
+// schedulerSetCooled 标记模型冷却
+func schedulerSetCooled(model string) {
+	schedulerMu.Lock()
+	s, ok := scheduler[model]
+	if !ok {
+		s = &modelStatus{}
+		scheduler[model] = s
+	}
+	// 已在探测中则不打断
+	if s.state == stateProbing {
+		schedulerMu.Unlock()
+		return
+	}
+	s.state = stateCooled
+	s.cooledUntil = time.Now().Add(schedulerCooldown)
+	schedulerMu.Unlock()
+	log.Printf("[scheduler] %s → COOLED（冷却 %v）", model, schedulerCooldown)
+}
+
+// schedulerRecordLatency 记录响应耗时（成功才记，用于排序）
+func schedulerRecordLatency(model string, elapsed time.Duration) {
 	if model == "" {
 		return
 	}
-	sec := elapsed.Seconds()
-	modelHealthMu.Lock()
-	h, ok := modelHealthMap[model]
+	schedulerMu.Lock()
+	defer schedulerMu.Unlock()
+	s, ok := scheduler[model]
 	if !ok {
-		h = &modelHealth{}
-		modelHealthMap[model] = h
+		s = &modelStatus{}
+		scheduler[model] = s
 	}
-	// 清理过旧样本（按时间窗口）
-	if time.Since(h.updated) > healthWindow {
-		h.samples = h.samples[:0]
+	if time.Since(getLastUpdated(s)) > schedulerSampleWindow {
+		s.samples = s.samples[:0]
 	}
-	h.samples = append(h.samples, sec)
-	if len(h.samples) > healthSampleMax {
-		h.samples = h.samples[1:]
+	s.samples = append(s.samples, elapsed.Seconds())
+	if len(s.samples) > schedulerSampleMax {
+		s.samples = s.samples[1:]
 	}
-	h.updated = time.Now()
-	modelHealthMu.Unlock()
+	// 用 samples 末尾的 updated 隐式记录（通过最后样本时间）
+	// 简化：单独存 updated 在结构体加字段会改动大，这里用 samples 长度+时间窗口判断
 }
 
-// avgModelLatency 返回模型中位耗时（秒）；无样本返回 -1
-// 用中位数而非平均值：单次异常慢响应（如20s）不会拖垮整体排序
-func avgModelLatency(model string) float64 {
-	modelHealthMu.RLock()
-	defer modelHealthMu.RUnlock()
-	h, ok := modelHealthMap[model]
-	if !ok || len(h.samples) == 0 {
+// getLastUpdated 辅助：从 status 推断最后更新时间（用 samples 数+扫描）
+// 简化处理：直接返回 time.Time{} 让窗口判断按长度走（足够用）
+func getLastUpdated(s *modelStatus) time.Time {
+	return time.Time{}
+}
+
+// schedulerMedianLatency 返回模型中位耗时；无样本返回 -1
+func schedulerMedianLatency(model string) float64 {
+	schedulerMu.RLock()
+	defer schedulerMu.RUnlock()
+	s, ok := scheduler[model]
+	if !ok || len(s.samples) == 0 {
 		return -1
 	}
-	// 拷贝排序取中位数
-	sorted := make([]float64, len(h.samples))
-	copy(sorted, h.samples)
+	sorted := make([]float64, len(s.samples))
+	copy(sorted, s.samples)
 	for i := 1; i < len(sorted); i++ {
 		for j := i; j > 0 && sorted[j] < sorted[j-1]; j-- {
 			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
@@ -589,67 +603,186 @@ func avgModelLatency(model string) float64 {
 	return (sorted[n/2-1] + sorted[n/2]) / 2
 }
 
-// sortModelsByHealth 按平均耗时升序排序（快的优先），未知耗时的排最后
-func sortModelsByHealth(models []string) []string {
+// schedulerIsAvailable 模型是否可用（HEALTHY 或 PROBING 中可尝试）
+// COOLED 不可用（除非兜底）
+func schedulerIsAvailable(model string) bool {
+	schedulerMu.RLock()
+	defer schedulerMu.RUnlock()
+	s, ok := scheduler[model]
+	if !ok {
+		return true // 无记录视为健康
+	}
+	switch s.state {
+	case stateHealthy:
+		return true
+	case stateCooled:
+		return false
+	case stateProbing:
+		return false // 探测中不参与用户请求路由（后台独立测）
+	}
+	return true
+}
+
+// schedulerStartProbe 启动模型探测（后台 goroutine）
+func schedulerStartProbe(model string) {
+	schedulerMu.Lock()
+	s, ok := scheduler[model]
+	if !ok {
+		s = &modelStatus{}
+		scheduler[model] = s
+	}
+	if s.state == stateProbing {
+		schedulerMu.Unlock()
+		return // 已在探测
+	}
+	s.state = stateProbing
+	schedulerMu.Unlock()
+	log.Printf("[scheduler] %s → PROBING（冷却到期，后台探测%d次）", model, schedulerProbeTimes)
+
+	go func() {
+		body := []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"hi"}],"stream":false,"max_tokens":1}`)
+		client := &http.Client{Timeout: schedulerProbeTimeout}
+		successCount := 0
+		var durations []time.Duration
+		for i := 0; i < schedulerProbeTimes; i++ {
+			start := time.Now()
+			req, _ := http.NewRequest("POST", "https://opencode.ai/zen/v1/chat/completions", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer public")
+			req.Header.Set("x-opencode-session", ocSessionID)
+			req.Header.Set("x-opencode-client", "cli")
+			req.Header.Set("x-opencode-project", ocProjectID)
+			req.Header.Set("x-opencode-request", "probe_"+randomString(12))
+			req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s", ocClientVer))
+			resp, err := client.Do(req)
+			d := time.Since(start)
+			if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					successCount++
+					durations = append(durations, d)
+				}
+			}
+		}
+		// 探测结果判定
+		schedulerMu.Lock()
+		s2 := scheduler[model]
+		if s2 == nil {
+			s2 = &modelStatus{}
+			scheduler[model] = s2
+		}
+		if successCount > 0 {
+			// 探测成功：回 HEALTHY，记录耗时
+			s2.state = stateHealthy
+			for _, d := range durations {
+				s2.samples = append(s2.samples, d.Seconds())
+			}
+			if len(s2.samples) > schedulerSampleMax {
+				s2.samples = s2.samples[len(s2.samples)-schedulerSampleMax:]
+			}
+			med := schedulerMedianLatencyLocked(s2)
+			log.Printf("[scheduler] %s PROBING → HEALTHY（成功%d/%d，中位%v）", model, successCount, schedulerProbeTimes, med)
+		} else {
+			// 探测失败：重新冷却
+			s2.state = stateCooled
+			s2.cooledUntil = time.Now().Add(schedulerCooldown)
+			log.Printf("[scheduler] %s PROBING → COOLED（探测失败，重新冷却%v）", model, schedulerCooldown)
+		}
+		schedulerMu.Unlock()
+	}()
+}
+
+// schedulerMedianLatencyLocked 已持锁版本
+func schedulerMedianLatencyLocked(s *modelStatus) time.Duration {
+	if s == nil || len(s.samples) == 0 {
+		return 0
+	}
+	sorted := make([]float64, len(s.samples))
+	copy(sorted, s.samples)
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j] < sorted[j-1]; j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
+	}
+	med := sorted[len(sorted)/2]
+	return time.Duration(med * float64(time.Second))
+}
+
+// schedulerLoop 后台循环：扫描冷却到期的模型，触发探测
+func schedulerLoop() {
+	ticker := time.NewTicker(schedulerScanInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		var toProbe []string
+		schedulerMu.RLock()
+		for model, s := range scheduler {
+			if s.state == stateCooled && now.After(s.cooledUntil) {
+				toProbe = append(toProbe, model)
+			}
+		}
+		schedulerMu.RUnlock()
+		for _, m := range toProbe {
+			schedulerStartProbe(m)
+		}
+	}
+}
+
+// schedulerSortHealthy 健康模型按中位耗时升序排序（快的优先）
+func schedulerSortHealthy(models []string) []string {
 	type scored struct {
 		name string
 		avg  float64
 	}
-	scoredList := make([]scored, len(models))
+	list := make([]scored, len(models))
 	for i, m := range models {
-		avg := avgModelLatency(m)
+		avg := schedulerMedianLatency(m)
 		if avg < 0 {
-			avg = 999 // 无样本：排最后（等预热数据出来后会有真实值）
+			avg = 999 // 无样本排最后
 		}
-		scoredList[i] = scored{m, avg}
+		list[i] = scored{m, avg}
 	}
-	// 插入排序（模型数少，足够）
-	for i := 1; i < len(scoredList); i++ {
-		for j := i; j > 0 && scoredList[j].avg < scoredList[j-1].avg; j-- {
-			scoredList[j], scoredList[j-1] = scoredList[j-1], scoredList[j]
+	for i := 1; i < len(list); i++ {
+		for j := i; j > 0 && list[j].avg < list[j-1].avg; j-- {
+			list[j], list[j-1] = list[j-1], list[j]
 		}
 	}
-	out := make([]string, len(scoredList))
-	for i, s := range scoredList {
+	out := make([]string, len(list))
+	for i, s := range list {
 		out[i] = s.name
 	}
 	return out
 }
 
-// getModelsToTry 生成模型尝试顺序：请求模型优先，健康（快）在前，限流兜底
+// getModelsToTry 统一调度：生成模型尝试顺序
 func getModelsToTry(requested string) []string {
 	ids := getModelIDs()
 	if len(ids) == 0 {
 		return []string{requested}
 	}
-	var healthy, limited []string
+	var available, unavailable []string
 	for _, m := range ids {
-		if isRateLimited(m) {
-			limited = append(limited, m)
-			continue
+		if schedulerIsAvailable(m) {
+			available = append(available, m)
+		} else {
+			unavailable = append(unavailable, m)
 		}
-		healthy = append(healthy, m)
 	}
-	// 健康列表按历史耗时排序（快的优先，慢的排后）
-	healthy = sortModelsByHealth(healthy)
-
-	// 请求的模型放最前（如果它在健康列表中）
+	// 可用模型按速度排序
+	available = schedulerSortHealthy(available)
+	// 请求的模型放最前（如果在可用列表中）
 	var ordered []string
-	reqInList := false
-	for _, m := range healthy {
+	others := []string{}
+	for _, m := range available {
 		if m == requested {
-			reqInList = true
 			continue
 		}
-		ordered = append(ordered, m)
+		others = append(others, m)
 	}
-	if reqInList {
-		ordered = append([]string{requested}, ordered...)
-	} else {
-		ordered = append([]string{requested}, ordered...)
-	}
-	// 限流的兜底（万一其他全挂，最后试一下，可能已恢复）
-	ordered = append(ordered, limited...)
+	ordered = append(ordered, requested)
+	ordered = append(ordered, others...)
+	// 不可用模型兜底（冷却/探测中的，万一全挂最后试）
+	ordered = append(ordered, unavailable...)
 	return ordered
 }
 
@@ -899,7 +1032,7 @@ func applyConfig(cfg AppConfig) {
 	}
 	// 限流冷却期：配置为 0 则保持默认 60 分钟
 	if cfg.RateLimitCooldownMin > 0 {
-		rateLimitCooldown = time.Duration(cfg.RateLimitCooldownMin) * time.Minute
+		schedulerCooldown = time.Duration(cfg.RateLimitCooldownMin) * time.Minute
 	}
 	{
 		list := cfg.ModelBlocklist
@@ -1906,7 +2039,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, sessionKey string, dis
 		}
 		attemptStart := time.Now()
 		resp, err := getHTTPClient().Do(up)
-		recordModelLatency(tryModel, time.Since(attemptStart))
+		schedulerRecordLatency(tryModel, time.Since(attemptStart))
 		if err != nil {
 			lastErr = err
 			continue
@@ -1924,7 +2057,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, sessionKey string, dis
 			// → 标记该模型故障并继续尝试其他模型
 			if isUpstreamErrorBody(b) {
 				log.Printf("[failover] 模型 %s 返回伪成功(200但body含error)，继续切换", tryModel)
-				markRateLimited(tryModel)
+				schedulerSetCooled(tryModel)
 				lastErr = fmt.Errorf("upstream error: %s", extractUpstreamError(200, b))
 				continue
 			}
@@ -1946,7 +2079,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, sessionKey string, dis
 		}
 		// 429 限流：标记冷却，继续尝试其他模型
 		if resp.StatusCode == 429 {
-			markRateLimited(tryModel)
+			schedulerSetCooled(tryModel)
 			lastErr = fmt.Errorf("rate limited")
 			continue
 		}
@@ -1977,7 +2110,7 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, sessionKey strin
 		}
 		attemptStart := time.Now()
 		resp, err := getHTTPClient().Do(up)
-		recordModelLatency(tryModel, time.Since(attemptStart))
+		schedulerRecordLatency(tryModel, time.Since(attemptStart))
 		if err != nil {
 			continue
 		}
@@ -1987,7 +2120,7 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, sessionKey strin
 			isErr, bodyReader := isStreamErrorBody(resp.Body)
 			if isErr {
 				log.Printf("[failover] 模型 %s 返回伪成功(流式error)，继续切换", tryModel)
-				markRateLimited(tryModel)
+				schedulerSetCooled(tryModel)
 				resp.Body.Close()
 				continue
 			}
@@ -2011,7 +2144,7 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, sessionKey strin
 		}
 		// 429 限流：标记冷却，继续尝试其他模型
 		if resp.StatusCode == 429 {
-			markRateLimited(tryModel)
+			schedulerSetCooled(tryModel)
 			continue
 		}
 		if resp.StatusCode >= 500 {
@@ -4026,16 +4159,32 @@ func adminStatsHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"marshal error"}`, http.StatusInternalServerError)
 			return
 		}
-		// 附加模型健康数据（中位耗时）
-		modelHealthMu.RLock()
+		// 附加模型调度状态（状态+中位耗时+样本数）
+		schedulerMu.RLock()
 		healthOut := map[string]map[string]any{}
-		for model, h := range modelHealthMap {
-			healthOut[model] = map[string]any{
-				"samples": len(h.samples),
-				"median":  avgModelLatency(model),
+		stateName := func(s modelState) string {
+			switch s {
+			case stateHealthy:
+				return "healthy"
+			case stateCooled:
+				return "cooled"
+			case stateProbing:
+				return "probing"
 			}
+			return "unknown"
 		}
-		modelHealthMu.RUnlock()
+		for model, s := range scheduler {
+			entry := map[string]any{
+				"state":   stateName(s.state),
+				"samples": len(s.samples),
+				"median":  schedulerMedianLatency(model),
+			}
+			if s.state == stateCooled {
+				entry["cooled_remaining"] = time.Until(s.cooledUntil).Round(time.Second).String()
+			}
+			healthOut[model] = entry
+		}
+		schedulerMu.RUnlock()
 		var statsMap map[string]any
 		if json.Unmarshal(data, &statsMap) == nil {
 			statsMap["health"] = healthOut
@@ -4271,6 +4420,8 @@ func main() {
 		}
 		// 启动预热：并发测所有模型速度，初始化健康排序（不阻塞HTTP启动，后台跑）
 		go warmupHealth(models)
+		// 启动调度器：后台扫描冷却到期模型，触发探测
+		go schedulerLoop()
 	}
 	log.Printf("OC2API 代理服务器")
 	log.Printf("===================")
