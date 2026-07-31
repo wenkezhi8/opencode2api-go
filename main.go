@@ -3846,6 +3846,23 @@ func adminStatsHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"marshal error"}`, http.StatusInternalServerError)
 			return
 		}
+		// 附加模型健康数据（中位耗时）
+		modelHealthMu.RLock()
+		healthOut := map[string]map[string]any{}
+		for model, h := range modelHealthMap {
+			healthOut[model] = map[string]any{
+				"samples": len(h.samples),
+				"median":  avgModelLatency(model),
+			}
+		}
+		modelHealthMu.RUnlock()
+		var statsMap map[string]any
+		if json.Unmarshal(data, &statsMap) == nil {
+			statsMap["health"] = healthOut
+			if out, err := json.Marshal(statsMap); err == nil {
+				data = out
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(data)
 	case http.MethodDelete:
@@ -4034,7 +4051,7 @@ function esc(s){const d=document.createElement('div');d.textContent=s;return d.i
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 
 async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await apiFetch('/admin/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
-async function loadStats(){try{const r=await apiFetch('/admin/api/stats');const d=await r.json();const ms=d.models||{};const ks=Object.keys(ms);let h='<table class="alias-table"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="5" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;for(const k of ks){const m=ms[k];h+='<tr><td>'+esc(k)+'</td><td>'+m.request_count+'</td><td>'+m.prompt_tokens+'</td><td>'+m.completion_tokens+'</td><td>'+m.total_tokens+'</td></tr>';tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}h+='<tr style="font-weight:600;background:#f8f8f8"><td>总计</td><td>'+tr+'</td><td>'+pt+'</td><td>'+ct+'</td><td>'+tt+'</td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}window.onload=async function(){try{const r=await fetch('/admin/api/config');if(r.ok){const cfg=await r.json();if(cfg.api_key){document.getElementById('loginOverlay').classList.add('show')}else{loadConfig();loadStats()}}else{document.getElementById('loginOverlay').classList.add('show')}}catch(e){document.getElementById('loginOverlay').classList.add('show')}};document.addEventListener('visibilitychange',function(){if(!document.hidden&&document.getElementById('mainContent').style.display!='none')loadStats()});
+async function loadStats(){try{const r=await apiFetch('/admin/api/stats');const d=await r.json();const ms=d.models||{};const hl=d.health||{};const ks=Object.keys(ms);let h='<table class="alias-table"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th><th>中位耗时</th><th>健康</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="7" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;let rows=[];for(const k of ks){const m=ms[k];const hh=hl[k]||{};const med=typeof hh.median==='number'?hh.median:null;const slow=med!==null&&med>8;const noData=med===null;const medTxt=med===null?'<span style="color:#999">—</span>':med.toFixed(1)+'s';const badge=noData?'<span style="color:#999">样本中</span>':(slow?'<span style="color:#e74c3c;font-weight:600">慢</span>':'<span style="color:#27ae60;font-weight:600">快</span>');const rowStyle=slow?' style="background:#fdf0ef"':'';rows.push({k,m,med,medTxt,badge,rowStyle});tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}rows.sort((a,b)=>{const ma=a.med===null?999:a.med;const mb=b.med===null?999:b.med;return ma-mb});for(const x of rows){h+='<tr'+x.rowStyle+'><td>'+esc(x.k)+'</td><td>'+x.m.request_count+'</td><td>'+x.m.prompt_tokens+'</td><td>'+x.m.completion_tokens+'</td><td>'+x.m.total_tokens+'</td><td>'+x.medTxt+'</td><td>'+x.badge+'</td></tr>'}h+='<tr style="font-weight:600;background:#f8f8f8"><td>总计</td><td>'+tr+'</td><td>'+pt+'</td><td>'+ct+'</td><td>'+tt+'</td><td></td><td></td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}window.onload=async function(){try{const r=await fetch('/admin/api/config');if(r.ok){const cfg=await r.json();if(cfg.api_key){document.getElementById('loginOverlay').classList.add('show')}else{loadConfig();loadStats()}}else{document.getElementById('loginOverlay').classList.add('show')}}catch(e){document.getElementById('loginOverlay').classList.add('show')}};document.addEventListener('visibilitychange',function(){if(!document.hidden&&document.getElementById('mainContent').style.display!='none')loadStats()});
 </script>
 </body>
 </html>`
