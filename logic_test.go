@@ -178,7 +178,7 @@ func TestMaskKey(t *testing.T) {
 		{"abcd", "****"},
 		{"abcde", "ab****de"},
 		{"sk-1234567890", "sk****90"},
-		{"wenkezhi", "we****hi"},
+		{"testkey1", "te****y1"},
 	}
 	for _, c := range cases {
 		if got := maskKey(c.in); got != c.want {
@@ -191,8 +191,8 @@ func TestMaskKey(t *testing.T) {
 func TestApplyConfigClearAPIKey(t *testing.T) {
 	resetState()
 	// 先设置一个 key
-	applyConfig(AppConfig{APIKey: "wenkezhi"})
-	if apiKey != "wenkezhi" {
+	applyConfig(AppConfig{APIKey: "test-key-abc"})
+	if apiKey != "test-key-abc" {
 		t.Fatalf("设置 key 失败: %q", apiKey)
 	}
 	// 再用空字符串清空
