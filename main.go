@@ -1492,7 +1492,109 @@ func extractUpstreamError(status int, body []byte) string {
 	return fmt.Sprintf("上游服务错误 (HTTP %d)", status)
 }
 
-func callOpenCodeAPI(upstreamBody []byte, modelID string, sessionKey string) ([]byte, int, http.Header, error) {
+// firstNonEmpty 返回第一个非空字符串（用于 fallback）
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// spoofModelName 把响应体中的 model 字段替换为客户端请求的模型名（failover 伪装）
+func spoofModelName(body []byte, displayModel string) []byte {
+	if displayModel == "" {
+		return body
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	if _, ok := m["model"]; ok {
+		m["model"] = displayModel
+		out, err := json.Marshal(m)
+		if err == nil {
+			return out
+		}
+	}
+	return body
+}
+
+// modelSpoofReader 包装流式响应体：逐行把 SSE chunk 中的 "model" 字段替换为客户端请求的模型名
+type modelSpoofReader struct {
+	src     io.ReadCloser
+	display string
+	br      *bufio.Reader
+	left    []byte
+}
+
+func (m *modelSpoofReader) Read(p []byte) (int, error) {
+	if m.br == nil {
+		m.br = bufio.NewReader(m.src)
+	}
+	for len(m.left) == 0 {
+		line, err := m.br.ReadBytes('\n')
+		if len(line) > 0 {
+			m.left = spoofStreamLine(line, m.display)
+		}
+		if err != nil {
+			if err == io.EOF && len(m.left) == 0 {
+				return 0, io.EOF
+			}
+			if err != io.EOF {
+				return 0, err
+			}
+			if len(m.left) > 0 {
+				break
+			}
+			return 0, io.EOF
+		}
+		if len(m.left) > 0 {
+			break
+		}
+	}
+	n := copy(p, m.left)
+	m.left = m.left[n:]
+	return n, nil
+}
+
+func (m *modelSpoofReader) Close() error {
+	return m.src.Close()
+}
+
+// spoofStreamLine 替换单行 SSE 数据中的 "model" 字段值
+func spoofStreamLine(line []byte, display string) []byte {
+	if !bytes.Contains(line, []byte(`"model"`)) {
+		return line
+	}
+	trimmed := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(trimmed, []byte("data: ")) {
+		return line
+	}
+	data := trimmed[len("data: "):]
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return line
+	}
+	if _, ok := raw["model"]; ok {
+		raw["model"] = display
+		out, err := json.Marshal(raw)
+		if err == nil {
+			// 保留原始行的换行格式
+			suffix := []byte("\n")
+			if bytes.HasSuffix(line, []byte("\r\n")) {
+				suffix = []byte("\r\n")
+			} else if !bytes.HasSuffix(line, []byte("\n")) {
+				suffix = nil
+			}
+			return append(append([]byte("data: "), out...), suffix...)
+		}
+	}
+	return line
+}
+
+func callOpenCodeAPI(upstreamBody []byte, modelID string, sessionKey string, displayModel string) ([]byte, int, http.Header, error) {
 	initOCSession()
 	sessionID := getSessionID(sessionKey)
 	modelsToTry := getModelsToTry(modelID)
@@ -1527,6 +1629,8 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, sessionKey string) ([]
 			if tryModel != modelID {
 				log.Printf("[failover] 模型 %s → %s 成功", modelID, tryModel)
 			}
+			// failover 伪装：响应里的模型名改回客户端请求的模型
+			b = spoofModelName(b, displayModel)
 			return b, resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
@@ -1553,7 +1657,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, sessionKey string) ([]
 	return nil, 500, nil, lastErr
 }
 
-func callOpenCodeAPIStream(upstreamBody []byte, modelID string, sessionKey string) (io.ReadCloser, int, http.Header, error) {
+func callOpenCodeAPIStream(upstreamBody []byte, modelID string, sessionKey string, displayModel string) (io.ReadCloser, int, http.Header, error) {
 	initOCSession()
 	sessionID := getSessionID(sessionKey)
 	modelsToTry := getModelsToTry(modelID)
@@ -1576,6 +1680,10 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, sessionKey strin
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			if tryModel != modelID {
 				log.Printf("[failover] 模型 %s → %s 成功(stream)", modelID, tryModel)
+			}
+			// failover 伪装：流式 chunk 里的模型名改回客户端请求的模型
+			if displayModel != "" {
+				return &modelSpoofReader{src: resp.Body, display: displayModel}, resp.StatusCode, resp.Header, nil
 			}
 			return resp.Body, resp.StatusCode, resp.Header, nil
 		}
@@ -1701,7 +1809,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&req)
 
 	if req.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, req.Model, getClientSessionKey(r))
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, req.Model, getClientSessionKey(r), firstNonEmpty(origModel, req.Model))
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
@@ -1777,7 +1885,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, req.Model, getClientSessionKey(r))
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, req.Model, getClientSessionKey(r), firstNonEmpty(origModel, req.Model))
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -2148,6 +2256,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 先解析别名，再对最终模型名做封禁检查（避免别名源名误伤）
+	claudeDisplayModel := strings.TrimSpace(claudeReq.Model)
 	claudeReq.Model = resolveModel(claudeReq.Model)
 
 	messages := claudeToOpenAIMessages(claudeReq.Messages, claudeReq.System)
@@ -2184,7 +2293,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&chatReq)
 
 	if claudeReq.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, getClientSessionKey(r))
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, getClientSessionKey(r), firstNonEmpty(claudeDisplayModel, chatReq.Model))
 		if err != nil || status < 200 || status >= 300 {
 			errResp := map[string]any{
 				"type":  "error",
@@ -2200,7 +2309,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, getClientSessionKey(r))
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, getClientSessionKey(r), firstNonEmpty(claudeDisplayModel, chatReq.Model))
 	if err != nil || status < 200 || status >= 300 {
 		errResp := map[string]any{
 			"type":  "error",
@@ -2767,6 +2876,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 先解析别名，再对最终模型名做封禁检查（避免别名源名误伤）
+	respDisplayModel := strings.TrimSpace(respReq.Model)
 	respReq.Model = resolveModel(respReq.Model)
 	if respReq.Model == "" {
 		respReq.Model = defaultModel
@@ -2830,7 +2940,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&chatReq)
 
 	if respReq.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, getClientSessionKey(r))
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, getClientSessionKey(r), firstNonEmpty(respDisplayModel, chatReq.Model))
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
@@ -2848,7 +2958,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, getClientSessionKey(r))
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, getClientSessionKey(r), firstNonEmpty(respDisplayModel, chatReq.Model))
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
