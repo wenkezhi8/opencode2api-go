@@ -399,6 +399,73 @@ var (
 	configMu             sync.RWMutex
 )
 
+// 限流感知故障转移：记录被上游 429 限流的模型及其解禁时间
+var (
+	rateLimitedModels   = map[string]time.Time{}
+	rateLimitedModelsMu sync.RWMutex
+	rateLimitCooldown   = 10 * time.Minute // 429 后该模型的冷却时间
+)
+
+// markRateLimited 记录模型被限流（带冷却期）
+func markRateLimited(model string) {
+	rateLimitedModelsMu.Lock()
+	rateLimitedModels[model] = time.Now().Add(rateLimitCooldown)
+	rateLimitedModelsMu.Unlock()
+	log.Printf("[failover] 模型 %s 被限流，进入 %v 冷却期", model, rateLimitCooldown)
+}
+
+// isRateLimited 检查模型是否在限流冷却期内
+func isRateLimited(model string) bool {
+	rateLimitedModelsMu.RLock()
+	expire, ok := rateLimitedModels[model]
+	rateLimitedModelsMu.RUnlock()
+	if !ok {
+		return false
+	}
+	if time.Now().After(expire) {
+		// 冷却期已过，清理
+		rateLimitedModelsMu.Lock()
+		delete(rateLimitedModels, model)
+		rateLimitedModelsMu.Unlock()
+		return false
+	}
+	return true
+}
+
+// getModelsToTry 生成模型尝试顺序：请求模型优先（若健康），未限流在前，限流兜底
+func getModelsToTry(requested string) []string {
+	ids := getModelIDs()
+	if len(ids) == 0 {
+		return []string{requested}
+	}
+	var healthy, limited []string
+	for _, m := range ids {
+		if isRateLimited(m) {
+			limited = append(limited, m)
+			continue
+		}
+		healthy = append(healthy, m)
+	}
+	// 请求的模型放在健康列表最前（如果它健康且在列表中）
+	var ordered []string
+	reqInList := false
+	for _, m := range healthy {
+		if m == requested {
+			reqInList = true
+			continue
+		}
+		ordered = append(ordered, m)
+	}
+	if reqInList {
+		ordered = append([]string{requested}, ordered...)
+	} else {
+		ordered = append([]string{requested}, ordered...)
+	}
+	// 限流的兜底（万一其他全挂，最后试一下，可能已恢复）
+	ordered = append(ordered, limited...)
+	return ordered
+}
+
 var defaultBlockedModels = []string{
 	"claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
 	"claude-opus-4-6", "claude-opus-4-5", "claude-opus-4-1", "claude-sonnet-5",
@@ -1341,16 +1408,7 @@ func buildOCRequest(modelID string, bodyMap map[string]any) (*http.Request, erro
 
 func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Header, error) {
 	initOCSession()
-	modelIDs := getModelIDs()
-	modelsToTry := []string{modelID}
-	for _, m := range modelIDs {
-		if m != modelID {
-			modelsToTry = append(modelsToTry, m)
-		}
-	}
-	if len(modelsToTry) == 0 {
-		modelsToTry = []string{modelID}
-	}
+	modelsToTry := getModelsToTry(modelID)
 
 	// 循环外解析一次
 	var bodyMap map[string]any
@@ -1379,12 +1437,21 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Hea
 			if isAnthropicFormat(b) {
 				b = convertAnthropicToOpenAI(b, tryModel)
 			}
+			if tryModel != modelID {
+				log.Printf("[failover] 模型 %s → %s 成功", modelID, tryModel)
+			}
 			return b, resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if debugMode {
 			log.Printf("[upstream error] model=%s status=%d body=%s", tryModel, resp.StatusCode, string(errBody))
+		}
+		// 429 限流：标记冷却，继续尝试其他模型
+		if resp.StatusCode == 429 {
+			markRateLimited(tryModel)
+			lastErr = fmt.Errorf("rate limited")
+			continue
 		}
 		if resp.StatusCode >= 500 {
 			lastErr = fmt.Errorf("upstream error")
@@ -1397,16 +1464,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Hea
 
 func callOpenCodeAPIStream(upstreamBody []byte, modelID string) (io.ReadCloser, int, http.Header, error) {
 	initOCSession()
-	modelIDs := getModelIDs()
-	modelsToTry := []string{modelID}
-	for _, m := range modelIDs {
-		if m != modelID {
-			modelsToTry = append(modelsToTry, m)
-		}
-	}
-	if len(modelsToTry) == 0 {
-		modelsToTry = []string{modelID}
-	}
+	modelsToTry := getModelsToTry(modelID)
 
 	// 循环外解析一次
 	var bodyMap map[string]any
@@ -1424,12 +1482,20 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string) (io.ReadCloser, 
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if tryModel != modelID {
+				log.Printf("[failover] 模型 %s → %s 成功(stream)", modelID, tryModel)
+			}
 			return resp.Body, resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if debugMode {
 			log.Printf("[upstream error] model=%s status=%d body=%s", tryModel, resp.StatusCode, string(errBody))
+		}
+		// 429 限流：标记冷却，继续尝试其他模型
+		if resp.StatusCode == 429 {
+			markRateLimited(tryModel)
+			continue
 		}
 		if resp.StatusCode >= 500 {
 			continue
