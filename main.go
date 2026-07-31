@@ -609,9 +609,9 @@ func applyConfig(cfg AppConfig) {
 		reasoningEffortMap = cfg.ReasoningEffortMap
 	}
 	forceDisableThinking = cfg.ForceDisableThinking
-	if cfg.APIKey != "" {
-		apiKey = cfg.APIKey
-	}
+	// 支持通过配置清空 API Key（传空字符串 = 关闭认证）
+	// 注意：直接赋值，前端 admin 保存总是携带 api_key 字段
+	apiKey = cfg.APIKey
 	{
 		list := cfg.ModelBlocklist
 		if list == nil {
@@ -1438,10 +1438,10 @@ func filterResponseHeaders(h http.Header) http.Header {
 
 // ======================== API Key 认证中间件 ========================
 
-	var authBypassPaths = map[string]bool{
-		"/health": true,
-		"/admin":  true,
-	}
+var authBypassPaths = map[string]bool{
+	"/health": true,
+	"/admin":  true,
+}
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -1491,6 +1491,13 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
+	// 用户显式指定了被封禁的模型 → 返回明确错误
+	if strings.TrimSpace(req.Model) != "" && isModelBlocked(strings.TrimSpace(req.Model)) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "模型 " + req.Model + " 不可用（已禁用）", "type": "invalid_request_error"}})
+		return
+	}
 	req.Model = resolveModel(req.Model)
 	if req.Model == "" {
 		req.Model = "deepseek-v4-flash-free"
@@ -1515,6 +1522,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		reader := bufio.NewReader(upResp)
 		doneSeen := false
+		var lastUsage *[3]int64
 		for {
 			line, err := reader.ReadString('\n')
 			if err != nil {
@@ -1543,34 +1551,27 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			out, usage := convertStreamChunkWithUsage(line, keepReasoning)
-			if out == "" {
-				// 空choices chunk，但可能有 usage
-				if usage != nil {
-					pt, _ := usage["prompt_tokens"].(float64)
-					ct, _ := usage["completion_tokens"].(float64)
-					tt, _ := usage["total_tokens"].(float64)
-					if tt > 0 {
-						recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
-					}
-				}
-				continue
-			}
-
-			// 提取 usage（已在 convertStreamChunkWithUsage 中解析）
-			if usage != nil && !doneSeen {
+			// token 统计：usage 只出现在流式响应的最后一个 chunk（finish_reason 或 usage-only chunk）
+			// 用 lastUsage 覆盖式记录，避免中间 chunk 重复累加
+			if usage != nil {
 				pt, _ := usage["prompt_tokens"].(float64)
 				ct, _ := usage["completion_tokens"].(float64)
 				tt, _ := usage["total_tokens"].(float64)
 				if tt > 0 {
-					recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
+					lastUsage = &[3]int64{int64(pt), int64(ct), int64(tt)}
 				}
 			}
-
+			if out == "" {
+				continue
+			}
 			w.Write([]byte(out))
 			w.Write([]byte("\n"))
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
+		}
+		if lastUsage != nil {
+			recordTokenUsage(req.Model, lastUsage[0], lastUsage[1], lastUsage[2])
 		}
 		return
 	}
@@ -1936,6 +1937,12 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	var claudeReq ClaudeRequest
 	if err := json.Unmarshal(body, &claudeReq); err != nil {
 		http.Error(w, `{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON"}}`, http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(claudeReq.Model) != "" && isModelBlocked(strings.TrimSpace(claudeReq.Model)) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "invalid_request_error", "message": "模型 " + claudeReq.Model + " 不可用（已禁用）"}})
 		return
 	}
 	claudeReq.Model = resolveModel(claudeReq.Model)
@@ -2556,6 +2563,12 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.TrimSpace(respReq.Model) != "" && isModelBlocked(strings.TrimSpace(respReq.Model)) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "模型 " + respReq.Model + " 不可用（已禁用）", "type": "invalid_request_error"}})
+		return
+	}
 	respReq.Model = resolveModel(respReq.Model)
 	if respReq.Model == "" {
 		respReq.Model = "deepseek-v4-flash-free"
