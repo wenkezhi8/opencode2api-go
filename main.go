@@ -191,32 +191,40 @@ var (
 )
 
 func getHTTPClient() *http.Client {
+	// 先读快照释放锁，避免 RR 模式下读锁升级写锁导致死锁
 	socks5Mu.RLock()
-	defer socks5Mu.RUnlock()
+	active := activeSocks5
+	proxies := append([]Socks5Proxy(nil), socks5Proxies...)
+	socks5Mu.RUnlock()
 
-	if activeSocks5 == "" {
+	if active == "" {
 		return httpClient
 	}
 
 	var proxy Socks5Proxy
 	var useRR bool
 
-	if activeSocks5 == socks5RR {
-		if len(socks5Proxies) == 0 {
+	if active == socks5RR {
+		if len(proxies) == 0 {
 			return httpClient
 		}
-		idx := atomic.AddUint32(&socks5RRIndex, 1) % uint32(len(socks5Proxies))
-		proxy = socks5Proxies[idx]
+		idx := atomic.AddUint32(&socks5RRIndex, 1) % uint32(len(proxies))
+		proxy = proxies[idx]
 		useRR = true
 	} else {
-		if socks5Client != nil && socks5ClientAddr == activeSocks5 {
-			return socks5Client
+		// 固定代理：先查缓存（短暂加锁读，避免与 applyConfig 写竞争）
+		socks5Mu.RLock()
+		cachedClient := socks5Client
+		cachedAddr := socks5ClientAddr
+		socks5Mu.RUnlock()
+		if cachedClient != nil && cachedAddr == active {
+			return cachedClient
 		}
 
 		var found bool
-		for i := range socks5Proxies {
-			if socks5Proxies[i].Addr == activeSocks5 {
-				proxy = socks5Proxies[i]
+		for i := range proxies {
+			if proxies[i].Addr == active {
+				proxy = proxies[i]
 				found = true
 				break
 			}
@@ -239,8 +247,10 @@ func getHTTPClient() *http.Client {
 
 	if !useRR {
 		// 固定代理缓存 client，复用连接池
+		socks5Mu.Lock()
 		socks5Client = client
-		socks5ClientAddr = activeSocks5
+		socks5ClientAddr = active
+		socks5Mu.Unlock()
 	} else {
 		// 轮询模式：每个代理一个缓存 client，避免每次新建
 		socks5Mu.Lock()
@@ -703,7 +713,12 @@ func saveTokenStats() {
 	if err != nil {
 		return
 	}
-	os.WriteFile(tokenStatsPath, data, 0644)
+	// 原子写：先写临时文件再 rename，避免与其他写者并发撕裂 stats.json
+	tmp := tokenStatsPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return
+	}
+	os.Rename(tmp, tokenStatsPath)
 }
 
 var (
