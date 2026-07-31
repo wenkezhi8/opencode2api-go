@@ -1390,7 +1390,49 @@ func convertResponse(data []byte, keepReasoning bool) ([]byte, error) {
 
 // ======================== OpenCode 上游调用 ========================
 
-func buildOCRequest(modelID string, bodyMap map[string]any) (*http.Request, error) {
+// 会话隔离：客户端会话标识 → 独立 ocSessionID（有 ID 独立，无 ID 全局兜底）
+var (
+	sessionMap   = map[string]string{}
+	sessionMapMu sync.RWMutex
+)
+
+// getSessionID 根据客户端会话 key 返回对应的上游 session ID：
+// key 存在则复用已有，不存在则新建（每个客户端会话独立）
+func getSessionID(key string) string {
+	if key == "" {
+		// 无会话标识：全局兜底（现状行为）
+		return ocSessionID
+	}
+	sessionMapMu.RLock()
+	sid, ok := sessionMap[key]
+	sessionMapMu.RUnlock()
+	if ok {
+		return sid
+	}
+	sid = "ses_" + randomString(24)
+	sessionMapMu.Lock()
+	// 双检：可能并发已创建
+	if existing, ok := sessionMap[key]; ok {
+		sid = existing
+	} else {
+		sessionMap[key] = sid
+	}
+	sessionMapMu.Unlock()
+	log.Printf("[session] 客户端会话 %s → 上游 %s", key, sid)
+	return sid
+}
+
+// getClientSessionKey 从客户端请求头提取会话标识（多级探测）
+func getClientSessionKey(r *http.Request) string {
+	for _, h := range []string{"x-codex-window-id", "x-session-id", "x-conversation-id", "x-thread-id", "x-conversation"} {
+		if v := strings.TrimSpace(r.Header.Get(h)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func buildOCRequest(modelID string, bodyMap map[string]any, sessionID string) (*http.Request, error) {
 	bodyMap["model"] = modelID
 	delete(bodyMap, "reasoning_effort")
 	tryBody, err := json.Marshal(bodyMap)
@@ -1406,7 +1448,7 @@ func buildOCRequest(modelID string, bodyMap map[string]any) (*http.Request, erro
 	req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s", ocClientVer))
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-project", ocProjectID)
-	req.Header.Set("x-opencode-session", ocSessionID)
+	req.Header.Set("x-opencode-session", sessionID)
 	req.Header.Set("x-opencode-request", "req_"+randomString(24))
 	req.Header.Set("Accept", "application/json")
 	return req, nil
@@ -1450,8 +1492,9 @@ func extractUpstreamError(status int, body []byte) string {
 	return fmt.Sprintf("上游服务错误 (HTTP %d)", status)
 }
 
-func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Header, error) {
+func callOpenCodeAPI(upstreamBody []byte, modelID string, sessionKey string) ([]byte, int, http.Header, error) {
 	initOCSession()
+	sessionID := getSessionID(sessionKey)
 	modelsToTry := getModelsToTry(modelID)
 
 	// 循环外解析一次
@@ -1462,7 +1505,7 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Hea
 
 	var lastErr error
 	for _, tryModel := range modelsToTry {
-		up, err := buildOCRequest(tryModel, bodyMap)
+		up, err := buildOCRequest(tryModel, bodyMap, sessionID)
 		if err != nil {
 			lastErr = err
 			continue
@@ -1510,8 +1553,9 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Hea
 	return nil, 500, nil, lastErr
 }
 
-func callOpenCodeAPIStream(upstreamBody []byte, modelID string) (io.ReadCloser, int, http.Header, error) {
+func callOpenCodeAPIStream(upstreamBody []byte, modelID string, sessionKey string) (io.ReadCloser, int, http.Header, error) {
 	initOCSession()
+	sessionID := getSessionID(sessionKey)
 	modelsToTry := getModelsToTry(modelID)
 
 	// 循环外解析一次
@@ -1521,7 +1565,7 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string) (io.ReadCloser, 
 	}
 
 	for _, tryModel := range modelsToTry {
-		up, err := buildOCRequest(tryModel, bodyMap)
+		up, err := buildOCRequest(tryModel, bodyMap, sessionID)
 		if err != nil {
 			continue
 		}
@@ -1625,7 +1669,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	cnt := requestCount.Add(1)
 	if debugMode {
-		log.Printf("[request #%d] POST /v1/chat/completions\n%s", cnt, string(body))
+		hdr := ""
+		for k, vs := range r.Header {
+			hdr += fmt.Sprintf("  %s: %s\n", k, strings.Join(vs, ", "))
+		}
+		log.Printf("[request #%d] POST /v1/chat/completions HEADERS:\n%sBODY:\n%s", cnt, hdr, string(body))
 	}
 
 	var req OpenAIRequest
@@ -1653,7 +1701,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&req)
 
 	if req.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, req.Model)
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, req.Model, getClientSessionKey(r))
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
@@ -1729,7 +1777,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, req.Model)
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, req.Model, getClientSessionKey(r))
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -2136,7 +2184,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&chatReq)
 
 	if claudeReq.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model)
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, getClientSessionKey(r))
 		if err != nil || status < 200 || status >= 300 {
 			errResp := map[string]any{
 				"type":  "error",
@@ -2152,7 +2200,7 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model)
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, getClientSessionKey(r))
 	if err != nil || status < 200 || status >= 300 {
 		errResp := map[string]any{
 			"type":  "error",
@@ -2782,7 +2830,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&chatReq)
 
 	if respReq.Stream {
-		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model)
+		upResp, status, _, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model, getClientSessionKey(r))
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
@@ -2800,7 +2848,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model)
+	respBody, status, _, err := callOpenCodeAPI(upstreamBody, chatReq.Model, getClientSessionKey(r))
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
