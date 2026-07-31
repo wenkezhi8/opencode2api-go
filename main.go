@@ -404,7 +404,7 @@ var (
 var (
 	rateLimitedModels   = map[string]time.Time{}
 	rateLimitedModelsMu sync.RWMutex
-	rateLimitCooldown   = 10 * time.Minute // 429 后该模型的冷却时间
+	rateLimitCooldown   = 60 * time.Minute // 429 后该模型的冷却时间（上游限流通常持续较久）
 )
 
 // markRateLimited 记录模型被限流（带冷却期）
@@ -563,6 +563,7 @@ type AppConfig struct {
 	APIKey               string            `json:"api_key,omitempty"`
 	ModelBlocklist       []string          `json:"model_blocklist,omitempty"`
 	DefaultModel         string            `json:"default_model,omitempty"`
+	RateLimitCooldownMin int               `json:"rate_limit_cooldown_minutes,omitempty"`
 }
 
 // ======================== Claude Messages API 类型 ========================
@@ -695,6 +696,10 @@ func applyConfig(cfg AppConfig) {
 	// 默认模型：配置为空则保持代码内置默认
 	if cfg.DefaultModel != "" {
 		defaultModel = cfg.DefaultModel
+	}
+	// 限流冷却期：配置为 0 则保持默认 60 分钟
+	if cfg.RateLimitCooldownMin > 0 {
+		rateLimitCooldown = time.Duration(cfg.RateLimitCooldownMin) * time.Minute
 	}
 	{
 		list := cfg.ModelBlocklist
