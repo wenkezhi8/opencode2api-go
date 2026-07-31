@@ -400,13 +400,14 @@ func fetchAllUpstreamModels() ([]string, error) {
 	return ids, nil
 }
 
-// warmupHealth 启动预热：并发测试所有模型响应速度，初始化健康排序
-// 只测一次（max_tokens=1 最小请求），耗时约 3-5 秒（并发）
+// warmupHealth 启动预热：并发测试所有模型响应速度（每模型测3次取中位数）
+// 初始化健康排序，耗时约 5-8 秒（并发）
 func warmupHealth(models []ModelInfo) {
 	if len(models) == 0 {
 		return
 	}
-	log.Printf("健康预热：测试 %d 个模型...", len(models))
+	const probeTimes = 3 // 每个模型测 3 次，取中位数（避免单次抖动）
+	log.Printf("健康预热：测试 %d 个模型（每个%d次取中位数）...", len(models), probeTimes)
 	type result struct {
 		model   string
 		elapsed time.Duration
@@ -418,17 +419,25 @@ func warmupHealth(models []ModelInfo) {
 		go func(id string) {
 			defer wg.Done()
 			body := []byte(`{"model":"` + id + `","messages":[{"role":"user","content":"hi"}],"stream":false,"max_tokens":1}`)
-			start := time.Now()
-			_, status, _, err := callOpenCodeAPI(body, id, "", id)
-			elapsed := time.Since(start)
-			if err != nil || status < 200 || status >= 300 {
-				// 失败（限流等）：记录一个较大值，排后面
-				recordModelLatency(id, 30*time.Second)
-				results <- result{id, 30 * time.Second}
-			} else {
-				recordModelLatency(id, elapsed)
-				results <- result{id, elapsed}
+			var durations []time.Duration
+			for i := 0; i < probeTimes; i++ {
+				start := time.Now()
+				_, status, _, err := callOpenCodeAPI(body, id, "", id)
+				d := time.Since(start)
+				if err != nil || status < 200 || status >= 300 {
+					d = 30 * time.Second // 失败（限流等）：记录较大值排后
+				}
+				recordModelLatency(id, d)
+				durations = append(durations, d)
 			}
+			// 取中位数（3次的中间值）
+			for i := 1; i < len(durations); i++ {
+				for j := i; j > 0 && durations[j] < durations[j-1]; j-- {
+					durations[j], durations[j-1] = durations[j-1], durations[j]
+				}
+			}
+			median := durations[len(durations)/2]
+			results <- result{id, median}
 		}(m.ID)
 	}
 	wg.Wait()
