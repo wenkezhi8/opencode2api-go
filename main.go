@@ -1019,8 +1019,18 @@ func applyConfig(cfg AppConfig) {
 	} else {
 		modelAlias = defaultAliasMap
 	}
-	if cfg.ReasoningEffortMap != nil {
-		reasoningEffortMap = cfg.ReasoningEffortMap
+	// 推理映射：默认值打底，config.json 配置覆盖/补充（避免部分配置丢默认项）
+	{
+		merged := map[string]string{
+			"none": "", "minimal": "", "low": "high", "medium": "high",
+			"high": "high", "xhigh": "max", "max": "max",
+		}
+		if cfg.ReasoningEffortMap != nil {
+			for k, v := range cfg.ReasoningEffortMap {
+				merged[k] = v
+			}
+		}
+		reasoningEffortMap = merged
 	}
 	forceDisableThinking = cfg.ForceDisableThinking
 	// 支持通过配置清空 API Key（传空字符串 = 关闭认证）
