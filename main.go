@@ -433,7 +433,92 @@ func isRateLimited(model string) bool {
 	return true
 }
 
-// getModelsToTry 生成模型尝试顺序：请求模型优先（若健康），未限流在前，限流兜底
+// ======================== 模型健康排序（按历史响应耗时） ========================
+
+const (
+	healthSampleMax = 10 // 每个模型保留的最近耗时样本数
+	healthWindow    = 5 * time.Minute // 样本有效窗口，超时旧样本丢弃
+)
+
+// modelHealth 单个模型的健康记录
+type modelHealth struct {
+	samples []float64 // 最近N次响应耗时（秒）
+	updated time.Time
+}
+
+var (
+	modelHealthMap   = map[string]*modelHealth{}
+	modelHealthMu    sync.RWMutex
+	unhealthyTimeout = 8.0 // 超过该耗时的模型视为"慢"（排序时排后）
+)
+
+// recordModelLatency 记录一次请求的耗时（成功与失败都记）
+func recordModelLatency(model string, elapsed time.Duration) {
+	if model == "" {
+		return
+	}
+	sec := elapsed.Seconds()
+	modelHealthMu.Lock()
+	h, ok := modelHealthMap[model]
+	if !ok {
+		h = &modelHealth{}
+		modelHealthMap[model] = h
+	}
+	// 清理过旧样本（按时间窗口）
+	if time.Since(h.updated) > healthWindow {
+		h.samples = h.samples[:0]
+	}
+	h.samples = append(h.samples, sec)
+	if len(h.samples) > healthSampleMax {
+		h.samples = h.samples[1:]
+	}
+	h.updated = time.Now()
+	modelHealthMu.Unlock()
+}
+
+// avgModelLatency 返回模型平均耗时（秒）；无样本返回 -1
+func avgModelLatency(model string) float64 {
+	modelHealthMu.RLock()
+	defer modelHealthMu.RUnlock()
+	h, ok := modelHealthMap[model]
+	if !ok || len(h.samples) == 0 {
+		return -1
+	}
+	var sum float64
+	for _, s := range h.samples {
+		sum += s
+	}
+	return sum / float64(len(h.samples))
+}
+
+// sortModelsByHealth 按平均耗时升序排序（快的优先），未知耗时的排中间
+func sortModelsByHealth(models []string) []string {
+	type scored struct {
+		name string
+		avg  float64
+	}
+	scoredList := make([]scored, len(models))
+	for i, m := range models {
+		avg := avgModelLatency(m)
+		if avg < 0 {
+			avg = 5.0 // 无样本：给个中等默认值，别排最前也别最后
+		}
+		scoredList[i] = scored{m, avg}
+	}
+	// 插入排序（模型数少，足够）
+	for i := 1; i < len(scoredList); i++ {
+		for j := i; j > 0 && scoredList[j].avg < scoredList[j-1].avg; j-- {
+			scoredList[j], scoredList[j-1] = scoredList[j-1], scoredList[j]
+		}
+	}
+	out := make([]string, len(scoredList))
+	for i, s := range scoredList {
+		out[i] = s.name
+	}
+	return out
+}
+
+// getModelsToTry 生成模型尝试顺序：请求模型优先，健康（快）在前，限流兜底
 func getModelsToTry(requested string) []string {
 	ids := getModelIDs()
 	if len(ids) == 0 {
@@ -447,7 +532,10 @@ func getModelsToTry(requested string) []string {
 		}
 		healthy = append(healthy, m)
 	}
-	// 请求的模型放在健康列表最前（如果它健康且在列表中）
+	// 健康列表按历史耗时排序（快的优先，慢的排后）
+	healthy = sortModelsByHealth(healthy)
+
+	// 请求的模型放最前（如果它在健康列表中）
 	var ordered []string
 	reqInList := false
 	for _, m := range healthy {
@@ -1483,18 +1571,19 @@ func isUpstreamErrorBody(body []byte) bool {
 }
 
 // isStreamErrorBody 检测流式响应的开头是否错误体（非 SSE 格式或含 error）
-func isStreamErrorBody(r io.Reader) bool {
+// 返回 (是否错误, 包装后的reader)——避免 bufio 预读导致后续丢数据
+func isStreamErrorBody(r io.Reader) (bool, io.Reader) {
 	br := bufio.NewReader(r)
 	peek, err := br.Peek(256)
 	if err != nil && err != io.EOF {
 		// 读取失败也视为故障，但无法回退（body 已损坏）
-		return true
+		return true, br
 	}
 	// 非 SSE 格式（没有 "data: "）且像 JSON 错误体 → 伪成功
 	if !bytes.Contains(peek, []byte("data: ")) && bytes.Contains(peek, []byte(`"error"`)) {
-		return true
+		return true, br
 	}
-	return false
+	return false, br
 }
 
 // 从上游错误响应提取用户可读的错误信息
@@ -1549,7 +1638,8 @@ func spoofModelName(body []byte, displayModel string) []byte {
 
 // modelSpoofReader 包装流式响应体：逐行把 SSE chunk 中的 "model" 字段替换为客户端请求的模型名
 type modelSpoofReader struct {
-	src     io.ReadCloser
+	src     io.Reader // 读取源（可能是包装后的 bufio.Reader）
+	closer  io.Closer // 关闭源（原始 resp.Body）
 	display string
 	br      *bufio.Reader
 	left    []byte
@@ -1586,7 +1676,10 @@ func (m *modelSpoofReader) Read(p []byte) (int, error) {
 }
 
 func (m *modelSpoofReader) Close() error {
-	return m.src.Close()
+	if m.closer != nil {
+		return m.closer.Close()
+	}
+	return nil
 }
 
 // spoofStreamLine 替换单行 SSE 数据中的 "model" 字段值
@@ -1638,7 +1731,9 @@ func callOpenCodeAPI(upstreamBody []byte, modelID string, sessionKey string, dis
 			lastErr = err
 			continue
 		}
+		attemptStart := time.Now()
 		resp, err := getHTTPClient().Do(up)
+		recordModelLatency(tryModel, time.Since(attemptStart))
 		if err != nil {
 			lastErr = err
 			continue
@@ -1707,15 +1802,20 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, sessionKey strin
 		if err != nil {
 			continue
 		}
+		attemptStart := time.Now()
 		resp, err := getHTTPClient().Do(up)
+		recordModelLatency(tryModel, time.Since(attemptStart))
 		if err != nil {
 			continue
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			// 伪成功检测：peek 一小段看是否错误体（Upstream request failed 等）
-			if isStreamErrorBody(resp.Body) {
+			// 注意：返回的 br 是包装后的 reader（已缓冲 peek 的数据），后续读取用它
+			isErr, bodyReader := isStreamErrorBody(resp.Body)
+			if isErr {
 				log.Printf("[failover] 模型 %s 返回伪成功(流式error)，继续切换", tryModel)
 				markRateLimited(tryModel)
+				resp.Body.Close()
 				continue
 			}
 			if tryModel != modelID {
@@ -1723,9 +1823,9 @@ func callOpenCodeAPIStream(upstreamBody []byte, modelID string, sessionKey strin
 			}
 			// failover 伪装：流式 chunk 里的模型名改回客户端请求的模型
 			if displayModel != "" {
-				return &modelSpoofReader{src: resp.Body, display: displayModel}, resp.StatusCode, resp.Header, nil
+				return &modelSpoofReader{src: bodyReader, closer: resp.Body, display: displayModel}, resp.StatusCode, resp.Header, nil
 			}
-			return resp.Body, resp.StatusCode, resp.Header, nil
+			return &modelSpoofReader{src: bodyReader, closer: resp.Body, display: ""}, resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
