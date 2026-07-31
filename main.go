@@ -187,6 +187,7 @@ var socks5RRIndex uint32
 var (
 	socks5Client      *http.Client // 缓存的 SOCKS5 客户端
 	socks5ClientAddr  string       // 缓存对应的代理地址
+	socks5Clients     map[string]*http.Client // 轮询模式的每个代理 client 缓存
 )
 
 func getHTTPClient() *http.Client {
@@ -237,8 +238,22 @@ func getHTTPClient() *http.Client {
 	}
 
 	if !useRR {
+		// 固定代理缓存 client，复用连接池
 		socks5Client = client
 		socks5ClientAddr = activeSocks5
+	} else {
+		// 轮询模式：每个代理一个缓存 client，避免每次新建
+		socks5Mu.Lock()
+		if socks5Clients == nil {
+			socks5Clients = map[string]*http.Client{}
+		}
+		cached, ok := socks5Clients[proxy.Addr]
+		if ok {
+			socks5Mu.Unlock()
+			return cached
+		}
+		socks5Clients[proxy.Addr] = client
+		socks5Mu.Unlock()
 	}
 	return client
 }
@@ -691,6 +706,17 @@ func saveTokenStats() {
 	os.WriteFile(tokenStatsPath, data, 0644)
 }
 
+var (
+	tokenStatsSaveCh   = make(chan struct{}, 1)
+	tokenStatsSaveOnce sync.Once
+)
+
+func tokenStatsSaveLoop() {
+	for range tokenStatsSaveCh {
+		saveTokenStats()
+	}
+}
+
 func recordTokenUsage(model string, promptTokens, completionTokens, totalTokens int64) {
 	tokenStatsMu.Lock()
 	tokenStats.TotalRequests++
@@ -704,7 +730,12 @@ func recordTokenUsage(model string, promptTokens, completionTokens, totalTokens 
 	ms.CompletionTokens += completionTokens
 	ms.TotalTokens += totalTokens
 	tokenStatsMu.Unlock()
-	go saveTokenStats()
+	// 非阻塞信号，单 goroutine 串行写文件，避免 goroutine 堆积和写竞争
+	tokenStatsSaveOnce.Do(func() { go tokenStatsSaveLoop() })
+	select {
+	case tokenStatsSaveCh <- struct{}{}:
+	default:
+	}
 }
 
 // ======================== Thinking/Reasoning 判断 ========================
